@@ -17,24 +17,41 @@ if not logger.handlers:
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
 
-def validate_finding_schema(finding):
-    """Validates if the finding conforms to the expected schema."""
-    required_fields = [
-        "SchemaVersion", "Id", "ProductArn", "GeneratorId", "AwsAccountId", "Types",
-        "CreatedAt", "UpdatedAt", "Severity", "Title", "Description", "Resources",
-        "Compliance", "RecordState"
-    ]
-    
-    # Check if the required fields exist in the finding
-    for field in required_fields:
-        if field not in finding:
-            raise ValueError(f"Missing required field: {field}")
-    
-    # Validate that 'Resources' is a list
-    if not isinstance(finding["Resources"], list):
-        raise ValueError("The 'Resources' field must be a list.")
-    
-    logger.info(f"Finding {finding['Id']} passed validation.")
+def batch_import_findings_with_retry(findings_list):
+    """Send findings to AWS Security Hub using batch_import_findings with retry logic."""
+    max_retries = 5
+    delay = 1  # Initial delay in seconds
+    for attempt in range(max_retries):
+        try:
+            # Log findings for better visibility before sending to Security Hub
+            logger.debug(f"Attempting to send findings to Security Hub: {findings_list}")
+
+            response = securityhub_client.batch_import_findings(Findings=findings_list)
+            logger.info(f"Successfully sent batch of {len(findings_list)} findings to AWS Security Hub.")
+            logger.debug(f"Response from AWS Security Hub: {response}")
+            return True  # Return True if successful
+        except ClientError as e:
+            error_code = e.response.get("Error", {}).get("Code", "UnknownError")
+            error_message = e.response.get("Error", {}).get("Message", "No error message available")
+
+            if attempt == 0:
+                # Log the detailed error from the FIRST failure
+                logger.error(f"Initial failure: {error_code} - {error_message}")
+            
+            logger.error(f"ClientError on attempt {attempt + 1}: {error_code} - {error_message}")
+
+            if error_code in ["ThrottlingException", "TooManyRequestsException"]:
+                logger.warning(f"Throttling error encountered. Retrying in {delay} seconds...")
+                time.sleep(delay)
+                delay *= 2  # Exponential backoff
+            else:
+                logger.error(f"Unrecoverable ClientError occurred: {e}")
+                break  # Break out of the loop for unrecoverable errors
+        except Exception as e:
+            logger.error(f"Unexpected error on attempt {attempt + 1}: {e}")
+            break  # Break out of the loop for unexpected errors
+    logger.error("Max retries reached. Failed to send findings to AWS Security Hub.")
+    return False  # Return False if all retries are exhausted
 
 def lambda_handler(event, context):
     try:
@@ -94,23 +111,13 @@ def lambda_handler(event, context):
                                     "RecordState": "ACTIVE"
                                 }
 
-                                # Validate the finding before adding it to the list
-                                validate_finding_schema(finding)
+                                # Add the finding to the list
                                 non_compliant_keys.append(finding)
 
                 except ClientError as e:
                     logger.error(f"Error retrieving access keys for user {user['UserName']}: {e}")
 
-        # Send findings to Security Hub
-        if non_compliant_keys:
-            logger.info(f"Sending {len(non_compliant_keys)} findings to Security Hub")
-            try:
-                response = securityhub_client.batch_import_findings(Findings=non_compliant_keys)
-                logger.info(f"Successfully sent findings to Security Hub: {response}")
-            except ClientError as e:
-                logger.error(f"Failed to send findings to Security Hub: {e}")
-
-        # Report compliance status to AWS Config
+        # First, report compliance status to AWS Config
         compliance_type = "NON_COMPLIANT" if non_compliant_keys else "COMPLIANT"
         config_client.put_evaluations(
             Evaluations=[
@@ -125,6 +132,12 @@ def lambda_handler(event, context):
         )
         logger.info(f"Compliance status reported to AWS Config: {compliance_type}")
 
+        # Then, send findings to Security Hub with retry mechanism
+        if non_compliant_keys:
+            logger.info(f"Sending {len(non_compliant_keys)} findings to AWS Security Hub")
+            batch_import_findings_with_retry(non_compliant_keys)
+
+        logger.info("Process completed successfully")
         return {
             "statusCode": 200,
             "compliance_type": compliance_type
