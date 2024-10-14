@@ -1,7 +1,7 @@
 import boto3
 import logging
 import time
-import json
+import traceback
 from datetime import datetime, timedelta, timezone
 from botocore.exceptions import ClientError
 
@@ -19,51 +19,27 @@ if not logger.handlers:
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
 
-# AWS Security Hub limits
-MAX_FINDINGS_PER_BATCH = 100
-MAX_FINDING_SIZE = 240 * 1024  # 240 KB in bytes
-MAX_BATCH_SIZE = 6 * 1024 * 1024  # 6 MB in bytes
-
-def validate_finding_size(finding):
-    """Validate that the finding does not exceed the maximum size."""
-    finding_json = json.dumps(finding)
-    finding_size = len(finding_json.encode('utf-8'))  # Calculate size in bytes
-
-    if finding_size > MAX_FINDING_SIZE:
-        raise ValueError(f"Finding {finding['Id']} exceeds the maximum size of 240 KB (size: {finding_size} bytes).")
-    return finding_size
-
 def batch_import_findings_with_retry(findings_list):
     """Send findings to AWS Security Hub using batch_import_findings with retry logic."""
     max_retries = 5
     delay = 1  # Initial delay in seconds
     for attempt in range(max_retries):
         try:
-            # Log findings for better visibility before sending to Security Hub
             logger.debug(f"Attempting to send findings to Security Hub: {findings_list}")
-
-            # Ensure the total size of the findings does not exceed 6 MB
-            total_size = sum(validate_finding_size(finding) for finding in findings_list)
-            if total_size > MAX_BATCH_SIZE:
-                raise ValueError(f"Total size of findings exceeds 6 MB (total size: {total_size} bytes).")
-
-            # Validate schema of each finding
-            for finding in findings_list:
-                validate_finding_size(finding)
-
             response = securityhub_client.batch_import_findings(Findings=findings_list)
             logger.info(f"Successfully sent batch of {len(findings_list)} findings to AWS Security Hub.")
             logger.debug(f"Response from AWS Security Hub: {response}")
-            return True  # Return True if successful
+            return True
         except ClientError as e:
             error_code = e.response.get("Error", {}).get("Code", "UnknownError")
             error_message = e.response.get("Error", {}).get("Message", "No error message available")
+            status_code = e.response.get("ResponseMetadata", {}).get("HTTPStatusCode", "UnknownStatusCode")
+            request_id = e.response.get("ResponseMetadata", {}).get("RequestId", "UnknownRequestId")
 
             if attempt == 0:
-                # Log the detailed error from the FIRST failure
-                logger.error(f"Initial failure: {error_code} - {error_message}")
-            
-            logger.error(f"ClientError on attempt {attempt + 1}: {error_code} - {error_message}")
+                logger.error(f"Initial failure: {error_code} - {error_message} - Status Code: {status_code} - Request ID: {request_id}")
+
+            logger.error(f"ClientError on attempt {attempt + 1}: {error_code} - {error_message} - Status Code: {status_code}")
 
             if error_code in ["ThrottlingException", "TooManyRequestsException"]:
                 logger.warning(f"Throttling error encountered. Retrying in {delay} seconds...")
@@ -71,9 +47,11 @@ def batch_import_findings_with_retry(findings_list):
                 delay *= 2  # Exponential backoff
             else:
                 logger.error(f"Unrecoverable ClientError occurred: {e}")
+                logger.error(f"Error Traceback: {traceback.format_exc()}")
                 break  # Break out of the loop for unrecoverable errors
         except Exception as e:
             logger.error(f"Unexpected error on attempt {attempt + 1}: {e}")
+            logger.error(f"Error Traceback: {traceback.format_exc()}")
             break  # Break out of the loop for unexpected errors
     logger.error("Max retries reached. Failed to send findings to AWS Security Hub.")
     return False  # Return False if all retries are exhausted
@@ -141,6 +119,7 @@ def lambda_handler(event, context):
 
                 except ClientError as e:
                     logger.error(f"Error retrieving access keys for user {user['UserName']}: {e}")
+                    logger.error(f"Error Traceback: {traceback.format_exc()}")
 
         # First, report compliance status to AWS Config
         compliance_type = "NON_COMPLIANT" if non_compliant_keys else "COMPLIANT"
@@ -170,6 +149,7 @@ def lambda_handler(event, context):
 
     except Exception as e:
         logger.error(f"General error occurred: {e}")
+        logger.error(f"Error Traceback: {traceback.format_exc()}")
         return {
             "statusCode": 500,
             "message": "An error occurred while processing the request."
