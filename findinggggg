@@ -1,7 +1,7 @@
 import boto3
 import logging
-import time
 import json
+import traceback
 from datetime import datetime, timedelta, timezone
 from botocore.exceptions import ClientError
 
@@ -93,37 +93,38 @@ def lambda_handler(event, context):
 
                         for key in access_keys:
                             # Ensure timezone-aware datetime comparison
-                            if key["CreateDate"] < rotation_threshold_date and key["Status"] == "Active":
+                            if key["Status"] == "Active":
                                 key_age_days = (datetime.now(timezone.utc) - key["CreateDate"]).days
-                                logger.warning(f"Access key {key['AccessKeyId']} is non-compliant (age: {key_age_days} days)")
+                                if key["CreateDate"] < rotation_threshold_date:
+                                    logger.warning(f"Access key {key['AccessKeyId']} is non-compliant (age: {key_age_days} days)")
 
-                                # Construct Security Hub finding
-                                finding = {
-                                    "SchemaVersion": "2018-10-08",
-                                    "Id": f"{user['UserName']}/{key['AccessKeyId']}",
-                                    "ProductArn": f"arn:aws:securityhub:{context.invoked_function_arn.split(':')[3]}:aws:product/aws/securityhub",
-                                    "GeneratorId": "iam-access-key-rotation-check",
-                                    "AwsAccountId": context.invoked_function_arn.split(":")[4],
-                                    "Types": ["Software and Configuration Checks/AWS Security Best Practices"],
-                                    "CreatedAt": datetime.now(timezone.utc).isoformat(),
-                                    "UpdatedAt": datetime.now(timezone.utc).isoformat(),
-                                    "Severity": {"Label": "HIGH"},
-                                    "Title": "IAM Access Key Rotation Best Practice Violation",
-                                    "Description": f"Active IAM access key {key['AccessKeyId']} for user {user['UserName']} is older than 23 months (Key Age: {key_age_days} days).",
-                                    "Resources": [
-                                        {
-                                            "Type": "AwsIamAccessKey",
-                                            "Id": key["AccessKeyId"],
-                                            "Partition": "aws",
-                                            "Region": context.invoked_function_arn.split(":")[3]
-                                        }
-                                    ],
-                                    "Compliance": {"Status": "FAILED"},
-                                    "RecordState": "ACTIVE"
-                                }
+                                    # Construct Security Hub finding
+                                    finding = {
+                                        "SchemaVersion": "2018-10-08",
+                                        "Id": f"{user['UserName']}/{key['AccessKeyId']}",
+                                        "ProductArn": f"arn:aws:securityhub:{context.invoked_function_arn.split(':')[3]}:aws:product/aws/securityhub",
+                                        "GeneratorId": "iam-access-key-rotation-check",
+                                        "AwsAccountId": context.invoked_function_arn.split(":")[4],
+                                        "Types": ["Software and Configuration Checks/AWS Security Best Practices"],
+                                        "CreatedAt": datetime.now(timezone.utc).isoformat(),
+                                        "UpdatedAt": datetime.now(timezone.utc).isoformat(),
+                                        "Severity": {"Label": "HIGH"},
+                                        "Title": "IAM Access Key Rotation Best Practice Violation",
+                                        "Description": f"Active IAM access key {key['AccessKeyId']} for user {user['UserName']} is older than 23 months (Key Age: {key_age_days} days).",
+                                        "Resources": [
+                                            {
+                                                "Type": "AwsIamAccessKey",
+                                                "Id": key["AccessKeyId"],
+                                                "Partition": "aws",
+                                                "Region": context.invoked_function_arn.split(":")[3]
+                                            }
+                                        ],
+                                        "Compliance": {"Status": "FAILED"},
+                                        "RecordState": "ACTIVE"
+                                    }
 
-                                # Add the finding to the list
-                                non_compliant_keys.append(finding)
+                                    # Add the finding to the list
+                                    non_compliant_keys.append(finding)
 
                 except ClientError as e:
                     logger.error(f"Error retrieving access keys for user {user['UserName']}: {e}")
