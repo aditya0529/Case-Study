@@ -163,3 +163,22 @@ def lambda_handler(event, context):
             "statusCode": 500,
             "message": "An error occurred while processing the request."
         }
+
+
+
+------
+
+
+def import_new_findings(new_finding):
+    """Import new audit findings to Security Hub"""
+    try:
+        response = securityhub.batch_import_findings(Findings=[new_finding])
+        if response['FailedCount'] > 0:
+            logger.warning("Failed to import {} findings".format(
+                response['FailedCount']))
+            logger.warning(response)
+        else:
+            logger.info("Findings imported to Security Hub")
+    except Exception as error:
+        logger.error("Error:  %s", error)
+        raise
