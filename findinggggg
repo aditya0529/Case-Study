@@ -1,61 +1,138 @@
-def map_iot_dd_audit_to_security_hub(finding):
-    """Create a Security Hub finding based on IoT Device Defender finding"""
-    severity = finding['severity']
-    resource_id = get_resource_identifier(finding)
-    resource_type = get_sh_resource_type(finding)
-    account_id = finding['accountId']
-    region = finding['region']
-    partition = finding['partition']
-    check_name = finding['checkName']
-    finding_id = f"arn:{partition}:iot-device-defender:{region}:{account_id}:audits/finding/{check_name}-{resource_id}"
-    task_id = finding['taskId']
-    audit_arn = finding['auditARN']
-    record_state = RECORDSTATE_ACTIVE
-    status = "FAILED"
-    description = finding['reasonForNonCompliance']
-    title = "IoT Device Defender: resource {} non compliant to {}".format(
-        resource_id, check_name)
-    d = datetime.datetime.utcnow()
-    new_recorded_time = d.isoformat() + "Z"
+import boto3
+import logging
+from datetime import datetime, timedelta, timezone
+from botocore.exceptions import ClientError
 
-    remediation_url = "https://console.aws.amazon.com/iot/home?region=" + \
-        region+"#/dd/audit/"+task_id+"/"+check_name
-    new_finding = {
-        "SchemaVersion": "2018-10-08",
-        "Id": finding_id,
-        "ProductArn": f"arn:{partition}:securityhub:{region}:{account_id}:product/{account_id}/default",
-        "GeneratorId": audit_arn,
-        "AwsAccountId": account_id,
-        "Compliance": {"Status": status},
-        "Types": [
-            f"{TYPE_PREFIX}/{check_name}"
-        ],
-        "CreatedAt": new_recorded_time,
-        "UpdatedAt": new_recorded_time,
-        "Severity": {
-            "Label": severity
-        },
-        "Title": title,
-        "Description": description,
-        'Remediation': {
-            'Recommendation': {
-                'Text': 'For directions on how to fix this issue, start mitigation action in AWS IoT Device Defender console',
-                'Url': remediation_url
-            }
-        },
-        "ProductFields": {
-            "ProviderName": "IoTDeviceDefender",
-            "ProviderVersion": "1.0",
-        },
-        'Resources': [
-            {
-                'Id': resource_id,
-                'Type': resource_type,
-                'Partition': "aws",
-                'Region': region
-            }
-        ],
-        'Workflow': {'Status': 'NEW'},
-        'RecordState': record_state
-    }
-    return new_finding
+# Initialize AWS clients
+iam_client = boto3.client("iam")
+config_client = boto3.client("config")
+securityhub_client = boto3.client("securityhub")
+
+# Configure logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    console_handler = logging.StreamHandler()
+    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+
+def validate_finding_schema(finding):
+    """Validates if the finding conforms to the expected schema."""
+    required_fields = [
+        "SchemaVersion", "Id", "ProductArn", "GeneratorId", "AwsAccountId", "Types",
+        "CreatedAt", "UpdatedAt", "Severity", "Title", "Description", "Resources",
+        "Compliance", "RecordState"
+    ]
+    
+    # Check if the required fields exist in the finding
+    for field in required_fields:
+        if field not in finding:
+            raise ValueError(f"Missing required field: {field}")
+    
+    # Validate that 'Resources' is a list
+    if not isinstance(finding["Resources"], list):
+        raise ValueError("The 'Resources' field must be a list.")
+    
+    logger.info(f"Finding {finding['Id']} passed validation.")
+
+def lambda_handler(event, context):
+    try:
+        logger.info(f"Received event: {event}")
+        # Set the threshold to 23 months (one month before 2-year key rotation)
+        threshold_days = 23 * 30
+        rotation_threshold_date = datetime.now(timezone.utc) - timedelta(days=threshold_days)
+
+        non_compliant_keys = []  # List to store non-compliant access keys
+        logger.info("Starting IAM access key compliance check...")
+
+        # Use paginator to list all IAM users
+        paginator = iam_client.get_paginator("list_users")
+        logger.info("Retrieving IAM users...")
+
+        for page in paginator.paginate():
+            users = page["Users"]
+            logger.info(f"Processing {len(users)} users")
+
+            for user in users:
+                logger.info(f"Processing user: {user['UserName']}")
+                try:
+                    # List access keys for each user
+                    key_paginator = iam_client.get_paginator("list_access_keys")
+                    for key_page in key_paginator.paginate(UserName=user["UserName"]):
+                        access_keys = key_page["AccessKeyMetadata"]
+                        logger.info(f"Found {len(access_keys)} access keys for user: {user['UserName']}")
+
+                        for key in access_keys:
+                            # Ensure timezone-aware datetime comparison
+                            if key["CreateDate"] < rotation_threshold_date and key["Status"] == "Active":
+                                key_age_days = (datetime.now(timezone.utc) - key["CreateDate"]).days
+                                logger.warning(f"Access key {key['AccessKeyId']} is non-compliant (age: {key_age_days} days)")
+
+                                # Construct Security Hub finding
+                                finding = {
+                                    "SchemaVersion": "2018-10-08",
+                                    "Id": f"{user['UserName']}/{key['AccessKeyId']}",
+                                    "ProductArn": f"arn:aws:securityhub:{context.invoked_function_arn.split(':')[3]}:aws:product/aws/securityhub",
+                                    "GeneratorId": "iam-access-key-rotation-check",
+                                    "AwsAccountId": context.invoked_function_arn.split(":")[4],
+                                    "Types": ["Software and Configuration Checks/AWS Security Best Practices"],
+                                    "CreatedAt": datetime.now(timezone.utc).isoformat(),
+                                    "UpdatedAt": datetime.now(timezone.utc).isoformat(),
+                                    "Severity": {"Label": "HIGH"},
+                                    "Title": "IAM Access Key Rotation Best Practice Violation",
+                                    "Description": f"Active IAM access key {key['AccessKeyId']} for user {user['UserName']} is older than 23 months (Key Age: {key_age_days} days).",
+                                    "Resources": [
+                                        {
+                                            "Type": "AwsIamAccessKey",
+                                            "Id": key["AccessKeyId"],
+                                            "Partition": "aws",
+                                            "Region": context.invoked_function_arn.split(":")[3]
+                                        }
+                                    ],
+                                    "Compliance": {"Status": "FAILED"},
+                                    "RecordState": "ACTIVE"
+                                }
+
+                                # Validate the finding before adding it to the list
+                                validate_finding_schema(finding)
+                                non_compliant_keys.append(finding)
+
+                except ClientError as e:
+                    logger.error(f"Error retrieving access keys for user {user['UserName']}: {e}")
+
+        # Send findings to Security Hub
+        if non_compliant_keys:
+            logger.info(f"Sending {len(non_compliant_keys)} findings to Security Hub")
+            try:
+                response = securityhub_client.batch_import_findings(Findings=non_compliant_keys)
+                logger.info(f"Successfully sent findings to Security Hub: {response}")
+            except ClientError as e:
+                logger.error(f"Failed to send findings to Security Hub: {e}")
+
+        # Report compliance status to AWS Config
+        compliance_type = "NON_COMPLIANT" if non_compliant_keys else "COMPLIANT"
+        config_client.put_evaluations(
+            Evaluations=[
+                {
+                    "ComplianceResourceType": "AWS::IAM::User",
+                    "ComplianceResourceId": "IAMAccessKeyCheck",
+                    "ComplianceType": compliance_type,
+                    "OrderingTimestamp": datetime.now(timezone.utc)
+                },
+            ],
+            ResultToken=event.get("resultToken", "NoTokenProvided")
+        )
+        logger.info(f"Compliance status reported to AWS Config: {compliance_type}")
+
+        return {
+            "statusCode": 200,
+            "compliance_type": compliance_type
+        }
+
+    except Exception as e:
+        logger.error(f"General error occurred: {e}")
+        return {
+            "statusCode": 500,
+            "message": "An error occurred while processing the request."
+        }
