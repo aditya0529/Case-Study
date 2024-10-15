@@ -1,0 +1,172 @@
+Certainly! Here’s the refactored code with separate methods for better modularity and readability:
+
+import boto3
+import logging
+from datetime import datetime, timezone
+from dateutil.relativedelta import relativedelta
+from botocore.exceptions import ClientError
+
+# Initialize AWS clients
+iam_client = boto3.client('iam')
+config_client = boto3.client('config')
+securityhub_client = boto3.client('securityhub')
+
+# Configure logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+def get_account_id_and_region(context):
+    """Extract AWS account ID and region from the Lambda context."""
+    arn_parts = context.invoked_function_arn.split(":")
+    region = arn_parts[3]
+    account_id = arn_parts[4]
+    return account_id, region
+
+def get_non_compliant_keys(rotation_threshold_date, account_id, region, product_arn):
+    """Retrieve non-compliant IAM access keys and construct findings."""
+    non_compliant_findings = []
+    paginator = iam_client.get_paginator('list_users')
+    for page in paginator.paginate():
+        users = page['Users']
+        for user in users:
+            user_name = user['UserName']
+            logger.info(f"Processing user: {user_name}")
+
+            try:
+                key_paginator = iam_client.get_paginator('list_access_keys')
+                for key_page in key_paginator.paginate(UserName=user_name):
+                    access_keys = key_page['AccessKeyMetadata']
+                    for key in access_keys:
+                        if key['Status'] == 'Active' and key['CreateDate'] < rotation_threshold_date:
+                            key_id = key['AccessKeyId']
+                            key_age_days = (datetime.now(timezone.utc) - key['CreateDate']).days
+                            logger.warning(f"Access key {key_id} for user {user_name} is non-compliant (age: {key_age_days} days)")
+
+                            finding = construct_finding(user_name, key, key_age_days, account_id, region, product_arn)
+                            non_compliant_findings.append(finding)
+            except ClientError as e:
+                logger.error(f"Error retrieving access keys for user {user_name}: {e}")
+                continue
+    return non_compliant_findings
+
+def construct_finding(user_name, key, key_age_days, account_id, region, product_arn):
+    """Construct a Security Hub finding for a non-compliant access key."""
+    key_id = key['AccessKeyId']
+    finding = {
+        "SchemaVersion": "2018-10-08",
+        "Id": f"{user_name}/{key_id}",
+        "ProductArn": product_arn,
+        "GeneratorId": "iam-access-key-rotation-check",
+        "AwsAccountId": account_id,
+        "Types": [
+            "Software and Configuration Checks/AWS Security Best Practices"
+        ],
+        "CreatedAt": datetime.now(timezone.utc).isoformat(),
+        "UpdatedAt": datetime.now(timezone.utc).isoformat(),
+        "Severity": {"Label": "HIGH"},
+        "Title": "IAM Access Key Rotation Best Practice Violation",
+        "Description": f"Active IAM access key {key_id} for user {user_name} is older than 23 months (Key Age: {key_age_days} days).",
+        "Resources": [
+            {
+                "Type": "AwsIamAccessKey",
+                "Id": f"arn:aws:iam::{account_id}:user/{user_name}",
+                "Partition": "aws",
+                "Region": region,
+                "Details": {
+                    "AwsIamAccessKey": {
+                        "UserName": user_name,
+                        "Status": key['Status'],
+                        "CreatedAt": key['CreateDate'].replace(tzinfo=timezone.utc).isoformat(),
+                        "AccessKeyId": key_id
+                    }
+                }
+            }
+        ],
+        "Compliance": {
+            "Status": "FAILED"
+        },
+        "RecordState": "ACTIVE"
+    }
+    return finding
+
+def report_compliance_to_config(compliance_type, event):
+    """Report the compliance status to AWS Config."""
+    try:
+        config_client.put_evaluations(
+            Evaluations=[
+                {
+                    'ComplianceResourceType': 'AWS::IAM::User',
+                    'ComplianceResourceId': 'IAMAccessKeyCheck',
+                    'ComplianceType': compliance_type,
+                    'OrderingTimestamp': datetime.now(timezone.utc)
+                },
+            ],
+            ResultToken=event.get('resultToken', 'NoTokenProvided')
+        )
+        logger.info(f"Compliance status reported to AWS Config: {compliance_type}")
+    except ClientError as e:
+        logger.error(f"Error reporting compliance status to AWS Config: {e}")
+
+def send_findings_to_security_hub(findings):
+    """Send the non-compliant findings to AWS Security Hub."""
+    try:
+        batch_size = 100
+        for i in range(0, len(findings), batch_size):
+            batch = findings[i:i+batch_size]
+            response = securityhub_client.batch_import_findings(Findings=batch)
+            logger.info(f"Successfully sent {len(batch)} findings to AWS Security Hub.")
+    except ClientError as e:
+        logger.error(f"Error sending findings to AWS Security Hub: {e}")
+
+def lambda_handler(event, context):
+    logger.info("Starting IAM access key compliance check...")
+
+    try:
+        # Set the threshold to 23 months ago
+        rotation_threshold_date = datetime.now(timezone.utc) - relativedelta(months=23)
+
+        # Get AWS Account ID and Region
+        account_id, region = get_account_id_and_region(context)
+
+        # Define ProductArn for custom findings
+        product_arn = f"arn:aws:securityhub:{region}:{account_id}:product/{account_id}/default"
+
+        # Get non-compliant access keys and construct findings
+        non_compliant_findings = get_non_compliant_keys(rotation_threshold_date, account_id, region, product_arn)
+
+        # Determine compliance type
+        compliance_type = 'NON_COMPLIANT' if non_compliant_findings else 'COMPLIANT'
+
+        # Report compliance status to AWS Config
+        report_compliance_to_config(compliance_type, event)
+
+        # Send findings to AWS Security Hub
+        if non_compliant_findings:
+            send_findings_to_security_hub(non_compliant_findings)
+
+        logger.info("IAM access key compliance check completed.")
+        return {
+            'statusCode': 200,
+            'compliance_type': compliance_type
+        }
+
+    except Exception as e:
+        logger.error(f"An unexpected error occurred: {e}")
+        return {
+            'statusCode': 500,
+            'message': 'An unexpected error occurred while processing the request.'
+        }
+
+Explanation:
+
+	•	Modularization: The code is broken down into separate functions, each responsible for a specific task.
+	•	get_account_id_and_region: Extracts account ID and region from the Lambda context.
+	•	get_non_compliant_keys: Retrieves IAM users and identifies non-compliant access keys.
+	•	construct_finding: Builds the finding object for Security Hub.
+	•	report_compliance_to_config: Reports the compliance status to AWS Config.
+	•	send_findings_to_security_hub: Sends findings to AWS Security Hub in batches.
+	•	Simplified Handler: The lambda_handler function now orchestrates the workflow by calling these helper functions, making it cleaner and easier to understand.
+	•	Error Handling: Each function includes try-except blocks where necessary to handle exceptions gracefully and log errors.
+	•	Comments and Logging: Added docstrings and comments for clarity, and logging statements to trace the execution flow and important events.
+
+This refactored code maintains the original functionality while enhancing readability and maintainability by adhering to best coding practices.
