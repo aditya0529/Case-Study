@@ -1,0 +1,562 @@
+Certainly! Below is the complete code with all methods extracted, including handling delete events from CloudWatch (EventBridge) rules. I will also provide the necessary IAM policies and a CloudFormation template to deploy the entire solution. Each section will be accompanied by explanations to help you understand how everything fits together.
+
+Complete Lambda Function Code
+
+import boto3
+import logging
+import os
+from datetime import datetime, timezone
+from dateutil.relativedelta import relativedelta
+from botocore.exceptions import ClientError
+
+# Initialize AWS clients
+iam_client = boto3.client('iam')
+securityhub_client = boto3.client('securityhub')
+sns_client = boto3.client('sns')
+
+# Configure logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# Read configuration from environment variables
+ROTATION_THRESHOLD_MONTHS = int(os.environ.get('ROTATION_THRESHOLD_MONTHS', '23'))
+SNS_TOPIC_ARN = os.environ.get('SNS_TOPIC_ARN')
+SEVERITY_THRESHOLD = os.environ.get('SEVERITY_THRESHOLD', 'HIGH')
+
+def get_account_id_and_region(context):
+    """Extract AWS account ID and region from the Lambda context."""
+    arn_parts = context.invoked_function_arn.split(":")
+    region = arn_parts[3]
+    account_id = arn_parts[4]
+    return account_id, region
+
+def list_all_users():
+    """List all IAM users."""
+    users = []
+    paginator = iam_client.get_paginator('list_users')
+    for page in paginator.paginate():
+        users.extend(page['Users'])
+    return users
+
+def list_access_keys_for_user(user_name):
+    """List all access keys for a given IAM user."""
+    access_keys = []
+    key_paginator = iam_client.get_paginator('list_access_keys')
+    for key_page in key_paginator.paginate(UserName=user_name):
+        access_keys.extend(key_page['AccessKeyMetadata'])
+    return access_keys
+
+def is_key_non_compliant(key, rotation_threshold_date):
+    """Check if an access key is non-compliant."""
+    return key['Status'] == 'Active' and key['CreateDate'] < rotation_threshold_date
+
+def construct_finding(user_name, key, key_age_days, account_id, region, product_arn):
+    """Construct a Security Hub finding for a non-compliant access key."""
+    key_id = key['AccessKeyId']
+    finding = {
+        "SchemaVersion": "2018-10-08",
+        "Id": f"{user_name}/{key_id}",
+        "ProductArn": product_arn,
+        "GeneratorId": "iam-access-key-rotation-check",
+        "AwsAccountId": account_id,
+        "Types": [
+            "Software and Configuration Checks/AWS Security Best Practices"
+        ],
+        "CreatedAt": datetime.now(timezone.utc).isoformat(),
+        "UpdatedAt": datetime.now(timezone.utc).isoformat(),
+        "Severity": {"Label": "HIGH"},
+        "Title": "IAM Access Key Rotation Best Practice Violation",
+        "Description": f"Active IAM access key {key_id} for user {user_name} is older than {ROTATION_THRESHOLD_MONTHS} months (Key Age: {key_age_days} days).",
+        "Resources": [
+            {
+                "Type": "AwsIamAccessKey",
+                "Id": f"arn:aws:iam::{account_id}:user/{user_name}",
+                "Partition": "aws",
+                "Region": region,
+                "Details": {
+                    "AwsIamAccessKey": {
+                        "UserName": user_name,
+                        "Status": key['Status'],
+                        "CreatedAt": key['CreateDate'].replace(tzinfo=timezone.utc).isoformat(),
+                        "AccessKeyId": key_id
+                    }
+                }
+            }
+        ],
+        "Compliance": {
+            "Status": "FAILED"
+        },
+        "RecordState": "ACTIVE"
+    }
+    return finding
+
+def get_non_compliant_findings(rotation_threshold_date, account_id, region, product_arn):
+    """Retrieve non-compliant IAM access keys and construct findings."""
+    non_compliant_findings = []
+    users = list_all_users()
+    for user in users:
+        user_name = user['UserName']
+        logger.info(f"Processing user: {user_name}")
+        try:
+            access_keys = list_access_keys_for_user(user_name)
+            for key in access_keys:
+                if is_key_non_compliant(key, rotation_threshold_date):
+                    key_id = key['AccessKeyId']
+                    key_age_days = (datetime.now(timezone.utc) - key['CreateDate']).days
+                    logger.warning(f"Access key {key_id} for user {user_name} is non-compliant (age: {key_age_days} days)")
+
+                    finding = construct_finding(user_name, key, key_age_days, account_id, region, product_arn)
+                    non_compliant_findings.append(finding)
+        except ClientError as e:
+            logger.error(f"Error retrieving access keys for user {user_name}: {e}")
+            continue
+    return non_compliant_findings
+
+def send_findings_to_security_hub(findings):
+    """Send the non-compliant findings to AWS Security Hub."""
+    try:
+        batch_size = 100
+        for i in range(0, len(findings), batch_size):
+            batch = findings[i:i+batch_size]
+            response = securityhub_client.batch_import_findings(Findings=batch)
+            logger.info(f"Successfully sent {len(batch)} findings to AWS Security Hub.")
+
+            # Send SNS notification if severity meets the threshold
+            for finding in batch:
+                if finding['Severity']['Label'] == SEVERITY_THRESHOLD and finding['RecordState'] == 'ACTIVE':
+                    send_sns_notification(finding)
+
+    except ClientError as e:
+        logger.error(f"Error sending findings to AWS Security Hub: {e}")
+
+def send_sns_notification(finding):
+    """Send SNS notification for high severity findings."""
+    try:
+        message = (
+            f"New high severity finding:\n"
+            f"Title: {finding['Title']}\n"
+            f"Description: {finding['Description']}\n"
+            f"Resource: {finding['Resources'][0]['Id']}"
+        )
+        sns_client.publish(
+            TopicArn=SNS_TOPIC_ARN,
+            Message=message,
+            Subject="High Severity Security Hub Finding"
+        )
+        logger.info("SNS notification sent for high severity finding.")
+    except ClientError as e:
+        logger.error(f"Error sending SNS notification: {e}")
+
+def update_finding_to_resolved(finding_id, account_id, region, product_arn):
+    """Update the Security Hub finding to RESOLVED."""
+    try:
+        securityhub_client.batch_update_findings(
+            FindingIdentifiers=[
+                {
+                    'Id': finding_id,
+                    'ProductArn': product_arn
+                },
+            ],
+            Workflow={
+                'Status': 'RESOLVED'
+            },
+            RecordState='ARCHIVED'
+        )
+        logger.info(f"Updated finding {finding_id} to RESOLVED.")
+    except ClientError as e:
+        logger.error(f"Error updating finding {finding_id} to RESOLVED: {e}")
+
+def handle_delete_access_key_event(event, account_id, region, product_arn):
+    """Handle IAM access key deletion events."""
+    if event['detail']['eventName'] == 'DeleteAccessKey':
+        user_name = event['detail']['requestParameters'].get('userName') or event['detail']['userIdentity']['userName']
+        access_key_id = event['detail']['requestParameters']['accessKeyId']
+        finding_id = f"{user_name}/{access_key_id}"
+        logger.info(f"Access key {access_key_id} for user {user_name} was deleted. Updating finding to RESOLVED.")
+
+        update_finding_to_resolved(finding_id, account_id, region, product_arn)
+        return {
+            'statusCode': 200,
+            'message': f"Finding {finding_id} updated to RESOLVED."
+        }
+
+def lambda_handler(event, context):
+    logger.info("Starting IAM access key compliance check...")
+
+    try:
+        # Set the rotation threshold date
+        rotation_threshold_date = datetime.now(timezone.utc) - relativedelta(months=ROTATION_THRESHOLD_MONTHS)
+
+        # Get AWS Account ID and Region
+        account_id, region = get_account_id_and_region(context)
+
+        # Define ProductArn for custom findings
+        product_arn = f"arn:aws:securityhub:{region}:{account_id}:product/{account_id}/default"
+
+        # Check if this is an access key deletion event
+        if 'detail-type' in event and event['detail-type'] == 'AWS API Call via CloudTrail':
+            return handle_delete_access_key_event(event, account_id, region, product_arn)
+
+        # Get non-compliant access keys and construct findings
+        non_compliant_findings = get_non_compliant_findings(rotation_threshold_date, account_id, region, product_arn)
+
+        # Send findings to AWS Security Hub
+        if non_compliant_findings:
+            send_findings_to_security_hub(non_compliant_findings)
+        else:
+            logger.info("No non-compliant access keys found.")
+
+        logger.info("IAM access key compliance check completed.")
+        return {
+            'statusCode': 200,
+            'message': 'Compliance check completed.'
+        }
+
+    except Exception as e:
+        logger.error(f"An unexpected error occurred: {e}")
+        return {
+            'statusCode': 500,
+            'message': 'An unexpected error occurred while processing the request.'
+        }
+
+Explanation
+
+Imports and Initializations
+
+	•	boto3: AWS SDK for Python.
+	•	logging: For logging debug and error messages.
+	•	os: To read environment variables.
+	•	datetime, timezone: For handling date and time operations.
+	•	dateutil.relativedelta: To compute date differences.
+	•	ClientError: Exception handling for AWS client errors.
+
+# Initialize AWS clients
+iam_client = boto3.client('iam')
+securityhub_client = boto3.client('securityhub')
+sns_client = boto3.client('sns')
+
+	•	Initialize clients for IAM, Security Hub, and SNS services.
+
+# Configure logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+	•	Set up the logging configuration.
+
+# Read configuration from environment variables
+ROTATION_THRESHOLD_MONTHS = int(os.environ.get('ROTATION_THRESHOLD_MONTHS', '23'))
+SNS_TOPIC_ARN = os.environ.get('SNS_TOPIC_ARN')
+SEVERITY_THRESHOLD = os.environ.get('SEVERITY_THRESHOLD', 'HIGH')
+
+	•	ROTATION_THRESHOLD_MONTHS: Number of months after which an access key is considered non-compliant.
+	•	SNS_TOPIC_ARN: The ARN of the SNS topic where notifications will be sent.
+	•	SEVERITY_THRESHOLD: The severity level that triggers an SNS notification.
+
+Helper Functions
+
+	•	get_account_id_and_region(context): Extracts AWS Account ID and region from the Lambda context.
+	•	list_all_users(): Retrieves all IAM users.
+	•	list_access_keys_for_user(user_name): Retrieves all access keys for a given IAM user.
+	•	is_key_non_compliant(key, rotation_threshold_date): Checks if an access key is non-compliant based on its creation date.
+	•	construct_finding(user_name, key, key_age_days, account_id, region, product_arn): Constructs a Security Hub finding for a non-compliant access key.
+	•	get_non_compliant_findings(rotation_threshold_date, account_id, region, product_arn): Iterates through all users and their access keys to identify non-compliant keys.
+	•	send_findings_to_security_hub(findings): Sends the findings to AWS Security Hub in batches of 100.
+	•	send_sns_notification(finding): Sends an SNS notification for findings that meet the severity threshold.
+	•	update_finding_to_resolved(finding_id, account_id, region, product_arn): Updates a Security Hub finding to ‘RESOLVED’ when an access key is deleted.
+	•	handle_delete_access_key_event(event, account_id, region, product_arn): Handles IAM access key deletion events triggered via EventBridge.
+
+Lambda Handler
+
+	•	lambda_handler(event, context): The main entry point for the Lambda function.
+	•	Checks if the event is an IAM access key deletion event.
+	•	If so, it calls handle_delete_access_key_event to update the corresponding Security Hub finding to ‘RESOLVED’.
+	•	If not, it proceeds to perform the compliance check by:
+	•	Calculating the rotation threshold date.
+	•	Retrieving non-compliant findings.
+	•	Sending findings to Security Hub.
+	•	Sending SNS notifications for high severity findings.
+
+IAM Policies for Lambda Function
+
+The Lambda function requires permissions to:
+
+	•	List IAM users and access keys.
+	•	Interact with AWS Security Hub (batch import and update findings).
+	•	Publish messages to an SNS topic.
+
+IAM Policy Document
+
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Action": [
+                "iam:ListUsers",
+                "iam:ListAccessKeys"
+            ],
+            "Effect": "Allow",
+            "Resource": "*"
+        },
+        {
+            "Action": [
+                "securityhub:BatchImportFindings",
+                "securityhub:BatchUpdateFindings"
+            ],
+            "Effect": "Allow",
+            "Resource": "*"
+        },
+        {
+            "Action": "sns:Publish",
+            "Effect": "Allow",
+            "Resource": "<SNS_TOPIC_ARN>"
+        },
+        {
+            "Action": "logs:CreateLogGroup",
+            "Effect": "Allow",
+            "Resource": "arn:aws:logs:*:*:*"
+        },
+        {
+            "Action": [
+                "logs:CreateLogStream",
+                "logs:PutLogEvents"
+            ],
+            "Effect": "Allow",
+            "Resource": [
+                "arn:aws:logs:*:*:log-group:/aws/lambda/*"
+            ]
+        }
+    ]
+}
+
+Note: Replace <SNS_TOPIC_ARN> with the actual ARN of your SNS topic.
+
+Explanation
+
+	•	iam:ListUsers, iam:ListAccessKeys: Allows listing IAM users and their access keys.
+	•	securityhub:BatchImportFindings, securityhub:BatchUpdateFindings: Allows importing and updating findings in AWS Security Hub.
+	•	sns:Publish: Allows publishing messages to the specified SNS topic.
+	•	logs: permissions: Allows the Lambda function to create log groups and streams, and put log events.
+
+CloudFormation Template
+
+Below is a CloudFormation template that sets up:
+
+	•	The Lambda function.
+	•	The necessary IAM role and policies.
+	•	An SNS topic with an email subscription.
+	•	An EventBridge rule to trigger the Lambda function on IAM access key deletions.
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: IAM Access Key Compliance Checker
+
+Parameters:
+  EmailAddress:
+    Type: String
+    Description: Email address to receive SNS notifications
+
+Resources:
+  # SNS Topic
+  ComplianceSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Endpoint: !Ref EmailAddress
+          Protocol: email
+
+  # IAM Role for Lambda
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: iam-access-key-compliance-lambda-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: iam-access-key-compliance-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                  - iam:ListUsers
+                  - iam:ListAccessKeys
+                Effect: Allow
+                Resource: '*'
+              - Action:
+                  - securityhub:BatchImportFindings
+                  - securityhub:BatchUpdateFindings
+                Effect: Allow
+                Resource: '*'
+              - Action: 'sns:Publish'
+                Effect: Allow
+                Resource: !GetAtt ComplianceSNSTopic.Arn
+              - Action:
+                  - logs:CreateLogGroup
+                Effect: Allow
+                Resource: 'arn:aws:logs:*:*:*'
+              - Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Effect: Allow
+                Resource: 'arn:aws:logs:*:*:log-group:/aws/lambda/*'
+
+  # Lambda Function
+  ComplianceLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: iam-access-key-compliance-checker
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          # Insert your Lambda function code here (same as the code provided above)
+      Timeout: 300
+      Environment:
+        Variables:
+          ROTATION_THRESHOLD_MONTHS: '23'
+          SNS_TOPIC_ARN: !Ref ComplianceSNSTopic
+          SEVERITY_THRESHOLD: 'HIGH'
+
+  # EventBridge Rule for Scheduled Compliance Checks
+  ScheduledRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: iam-access-key-compliance-scheduled-rule
+      ScheduleExpression: 'rate(1 day)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ComplianceLambdaFunction.Arn
+          Id: ComplianceLambdaFunction
+
+  # EventBridge Rule for Access Key Deletion Events
+  AccessKeyDeletionRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: iam-access-key-deletion-rule
+      EventPattern:
+        source:
+          - aws.iam
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - iam.amazonaws.com
+          eventName:
+            - DeleteAccessKey
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ComplianceLambdaFunction.Arn
+          Id: ComplianceLambdaFunction
+
+  # Permission for EventBridge to invoke Lambda
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ComplianceLambdaFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: 'events.amazonaws.com'
+      SourceArn: !GetAtt ScheduledRule.Arn
+
+  LambdaInvokePermissionForDeletionRule:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ComplianceLambdaFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: 'events.amazonaws.com'
+      SourceArn: !GetAtt AccessKeyDeletionRule.Arn
+
+Outputs:
+  SNSTopicARN:
+    Description: ARN of the SNS Topic
+    Value: !Ref ComplianceSNSTopic
+  LambdaFunctionName:
+    Description: Name of the Lambda Function
+    Value: !Ref ComplianceLambdaFunction
+
+Explanation
+
+Parameters
+
+	•	EmailAddress: The email address that will receive SNS notifications.
+
+Resources
+
+	•	ComplianceSNSTopic: Creates an SNS topic and subscribes the provided email address to it.
+	•	LambdaExecutionRole: IAM role that the Lambda function assumes, with policies that allow it to perform required actions.
+	•	ComplianceLambdaFunction: The Lambda function that performs the compliance check and handles access key deletion events.
+	•	Code: In the ZipFile property, you should insert the code provided in the Lambda function above.
+	•	ScheduledRule: An EventBridge rule that triggers the Lambda function once a day to perform compliance checks.
+	•	AccessKeyDeletionRule: An EventBridge rule that triggers the Lambda function when an IAM access key is deleted.
+	•	LambdaInvokePermission and LambdaInvokePermissionForDeletionRule: Permissions that allow EventBridge to invoke the Lambda function.
+
+Outputs
+
+	•	SNSTopicARN: Outputs the ARN of the SNS topic created.
+	•	LambdaFunctionName: Outputs the name of the Lambda function.
+
+Deployment Steps
+
+	1.	Prepare the Lambda Function Code
+	•	Copy the provided Lambda function code into a file named index.py.
+	2.	Update the CloudFormation Template
+	•	Replace the # Insert your Lambda function code here comment in the ComplianceLambdaFunction resource’s Code property with the actual code from index.py. Ensure proper indentation.
+	3.	Deploy the CloudFormation Stack
+	•	Use the AWS CLI or AWS Console to deploy the CloudFormation template.
+	•	When deploying, provide the EmailAddress parameter.
+
+aws cloudformation deploy \
+  --template-file template.yaml \
+  --stack-name iam-access-key-compliance-stack \
+  --parameter-overrides EmailAddress=your-email@example.com \
+  --capabilities CAPABILITY_NAMED_IAM
+
+
+	•	Replace your-email@example.com with the email address where you want to receive notifications.
+
+	4.	Confirm SNS Subscription
+	•	Check your email for a subscription confirmation message from AWS SNS and confirm the subscription.
+	5.	Verify Security Hub is Enabled
+	•	Ensure that AWS Security Hub is enabled in your account.
+	6.	Test the Lambda Function
+	•	You can manually trigger the Lambda function via the AWS Console or CLI to test compliance checks.
+	•	To test the access key deletion handling, delete an access key and verify that the Lambda function updates the finding to ‘RESOLVED’.
+
+Additional Notes
+
+	•	Security Hub Findings
+	•	The findings are imported into AWS Security Hub and can be viewed in the console.
+	•	Findings are updated or archived based on the status of the access keys.
+	•	SNS Notifications
+	•	Notifications are sent via SNS to the subscribed email address when high severity findings are detected.
+	•	EventBridge Rules
+	•	The ScheduledRule triggers the Lambda function once a day to perform compliance checks.
+	•	The AccessKeyDeletionRule triggers the Lambda function whenever an IAM access key is deleted, so it can update the corresponding finding.
+	•	Environment Variables
+	•	ROTATION_THRESHOLD_MONTHS: Configurable via the Lambda function’s environment variables. Default is 23 months.
+	•	SEVERITY_THRESHOLD: Can be adjusted if you want notifications for different severity levels.
+
+Best Practices
+
+	•	Configuration via Environment Variables
+	•	Allows for easy adjustments without modifying the code.
+	•	Use of AWS Services
+	•	Leveraging AWS Security Hub for centralized findings.
+	•	Using SNS for notifications to decouple the notification mechanism from the processing logic.
+	•	Modular Code Structure
+	•	Functions are modular and focused on single responsibilities, making the code maintainable and testable.
+	•	Error Handling
+	•	Comprehensive error handling with logging ensures that issues can be diagnosed and addressed promptly.
+	•	Least Privilege IAM Role
+	•	The IAM role grants only the necessary permissions required for the Lambda function to operate.
+
+Conclusion
+
+This solution provides a comprehensive way to monitor IAM access keys, ensure they comply with rotation policies, and handle access key deletions appropriately. By following the provided steps and explanations, you can deploy this solution in your AWS environment and customize it to meet your organization’s needs.
+
+If you have any questions or need further assistance, feel free to ask!
