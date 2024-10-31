@@ -1,0 +1,180 @@
+Sure! I’ll provide a comprehensive guide on how to use AWS Observability Access Manager (OAM) to send logs from one AWS account (Account A) to another (Account B) using AWS CloudFormation. This setup will include all necessary IAM roles and policies, following AWS best practices.
+
+Overview
+
+AWS OAM allows you to share observability data (like logs, metrics, and traces) across AWS accounts. By setting up a Sink in the source account and a Link in the destination account, you can enable cross-account access to logs.
+
+Prerequisites
+
+	•	Account A (Source Account): The AWS account where logs are generated.
+	•	Account B (Destination Account): The AWS account where logs will be sent.
+	•	AWS CLI or AWS Management Console: For deploying CloudFormation templates.
+	•	Permissions: Ensure you have the necessary permissions to create IAM roles, policies, and CloudFormation stacks in both accounts.
+
+Step 1: Set Up the Sink in Account A (Source Account)
+
+The Sink defines which observability data can be shared and with whom.
+
+CloudFormation Template for Account A (AccountA.yaml)
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Set up OAM Sink in Account A'
+
+Parameters:
+  DestinationAccountId:
+    Type: String
+    Description: 'AWS Account ID of the Destination Account (Account B)'
+
+Resources:
+  OAMSink:
+    Type: AWS::OAM::Sink
+    Properties:
+      Name: 'AccountA-OAMSink'
+      Policy: !Sub |
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "AllowAccountBRead",
+              "Effect": "ALLOW",
+              "Principal": {"AWS": "arn:aws:iam::${DestinationAccountId}:root"},
+              "Action": [
+                "cloudwatch:ReadLogs",
+                "cloudwatch:DescribeLogGroups"
+              ],
+              "Resource": "*"
+            }
+          ]
+        }
+
+Outputs:
+  SinkArn:
+    Description: 'The ARN of the OAM Sink'
+    Value: !GetAtt OAMSink.Arn
+
+Explanation:
+
+	•	OAMSink: Creates a Sink with a policy that allows Account B to read logs.
+	•	Policy: Grants cloudwatch:ReadLogs and cloudwatch:DescribeLogGroups to Account B.
+
+Step 2: Set Up the Link in Account B (Destination Account)
+
+The Link in Account B points to the Sink in Account A, enabling access to the shared logs.
+
+CloudFormation Template for Account B (AccountB.yaml)
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Set up OAM Link in Account B'
+
+Parameters:
+  SourceAccountId:
+    Type: String
+    Description: 'AWS Account ID of the Source Account (Account A)'
+  SinkArn:
+    Type: String
+    Description: 'ARN of the OAM Sink from Account A'
+
+Resources:
+  OAMLink:
+    Type: AWS::OAM::Link
+    Properties:
+      Label: 'AccountB-OAMLink'
+      ResourceTypes:
+        - 'AWS::CloudWatch::LogGroup'
+      SinkIdentifier: !Ref SinkArn
+
+Outputs:
+  LinkArn:
+    Description: 'The ARN of the OAM Link'
+    Value: !GetAtt OAMLink.Arn
+
+Explanation:
+
+	•	OAMLink: Creates a Link that connects to the Sink in Account A.
+	•	ResourceTypes: Specifies that we’re accessing AWS::CloudWatch::LogGroup resources.
+
+Step 3: Deploy the CloudFormation Templates
+
+Deploy in Account A:
+
+	1.	Save the AccountA.yaml template.
+	2.	Deploy using AWS CLI or AWS Console.
+Using AWS CLI:
+
+aws cloudformation deploy \
+  --stack-name AccountA-OAM-Sink \
+  --template-file AccountA.yaml \
+  --parameter-overrides DestinationAccountId=DESTINATION_ACCOUNT_ID \
+  --capabilities CAPABILITY_NAMED_IAM
+
+Replace DESTINATION_ACCOUNT_ID with Account B’s AWS Account ID.
+
+	3.	Note the output SinkArn.
+
+Deploy in Account B:
+
+	1.	Save the AccountB.yaml template.
+	2.	Deploy using AWS CLI or AWS Console.
+Using AWS CLI:
+
+aws cloudformation deploy \
+  --stack-name AccountB-OAM-Link \
+  --template-file AccountB.yaml \
+  --parameter-overrides SourceAccountId=SOURCE_ACCOUNT_ID SinkArn=SINK_ARN_FROM_ACCOUNT_A \
+  --capabilities CAPABILITY_NAMED_IAM
+
+Replace SOURCE_ACCOUNT_ID with Account A’s AWS Account ID and SINK_ARN_FROM_ACCOUNT_A with the SinkArn obtained from deploying in Account A.
+
+Step 4: Verify the Setup
+
+	•	In Account B:
+	•	Navigate to CloudWatch Logs.
+	•	You should see the log groups from Account A accessible according to the permissions set.
+
+Best Practices and Considerations
+
+	•	Least Privilege Principle: The IAM policies grant only the necessary permissions.
+	•	Policy Documents: Use IAM policy version 2012-10-17 for compatibility.
+	•	Resource Policies: Ensure that resource policies explicitly define principals and actions.
+	•	Monitoring and Auditing: Regularly review IAM roles and policies.
+
+Additional IAM Roles and Policies
+
+If you need to allow specific services or applications in Account B to access the logs, you may need to create IAM roles with permissions to read from the OAM Link.
+
+Example IAM Role in Account B
+
+Resources:
+  LogReaderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: 'LogReaderRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: 'ReadSharedLogsPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'cloudwatch:GetLogEvents'
+                  - 'cloudwatch:FilterLogEvents'
+                Resource: '*'
+
+Conclusion
+
+By setting up an OAM Sink in Account A and an OAM Link in Account B, you can efficiently and securely share logs between AWS accounts using CloudFormation. This method adheres to AWS best practices by employing least privilege IAM policies and automating resource creation.
+
+References
+
+	•	AWS Observability Access Manager Documentation
+	•	AWS CloudFormation Documentation
+	•	AWS IAM Best Practices
+
+Let me know if you need further assistance or modifications to the templates!
