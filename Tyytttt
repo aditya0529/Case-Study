@@ -1,0 +1,250 @@
+Certainly! To share logs and metrics from Account A (a123) to Account B (b234) using AWS CloudWatch Observability Manager (OEM), you’ll need to set up cross-account observability. This involves configuring IAM roles, permissions, and resource sharing between the two accounts.
+
+Below is a step-by-step guide, including all necessary code snippets, IAM roles, and explanations, following AWS best practices.
+
+Overview
+
+	1.	Prerequisites:
+	•	AWS CLI configured in both accounts.
+	•	Necessary permissions to create IAM roles, policies, and CloudFormation stacks.
+	2.	Steps:
+	•	Step 1: Enable AWS Organizations and set up trusted access for OEM.
+	•	Step 2: Configure Account A (Source Account - a123).
+	•	Step 3: Configure Account B (Monitoring Account - b234).
+	•	Step 4: Deploy CloudFormation templates provided by OEM.
+	•	Step 5: Verify the setup and test cross-account access.
+
+Prerequisites
+
+	•	Ensure that both accounts are part of the same AWS Organization.
+	•	You have administrator access in both accounts or the necessary permissions to perform the actions.
+
+Step 1: Enable AWS Organizations and Trusted Access for OEM
+
+1.1 Enable AWS Organizations
+
+If not already done, create an AWS Organization and add both accounts.
+
+	•	In Account B (b234) (Monitoring Account):
+
+aws organizations create-organization --feature-set ALL
+
+
+	•	Invite Account A (a123) to join the organization:
+
+aws organizations invite-account-to-organization --target Id=a123,Type=ACCOUNT
+
+
+
+1.2 Enable Trusted Access for CloudWatch OEM
+
+	•	In Account B (b234):
+
+aws organizations enable-aws-service-access --service-principal oem.cloudwatch.amazonaws.com
+
+
+	•	Register CloudWatch OEM as a delegated administrator:
+
+aws organizations register-delegated-administrator --account-id b234 --service-principal oem.cloudwatch.amazonaws.com
+
+
+
+Step 2: Configure Account A (Source Account - a123)
+
+2.1 Create an IAM Role for Cross-Account Access
+
+Create an IAM role in Account A that allows CloudWatch OEM in Account B to access logs and metrics.
+
+Trust Policy
+
+Create a trust policy that trusts Account B’s OEM service.
+
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::b234:root"
+      },
+      "Action": "sts:AssumeRole",
+      "Condition": {}
+    }
+  ]
+}
+
+Permissions Policy
+
+Attach a permissions policy that allows access to CloudWatch logs and metrics.
+
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowCloudWatchAccess",
+      "Effect": "Allow",
+      "Action": [
+        "cloudwatch:DescribeAlarms",
+        "cloudwatch:GetMetricData",
+        "cloudwatch:ListMetrics",
+        "logs:DescribeLogGroups",
+        "logs:GetLogEvents",
+        "logs:FilterLogEvents"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+
+Create the IAM Role
+
+Use the AWS CLI or AWS Management Console to create the role.
+
+Using AWS CLI:
+
+aws iam create-role --role-name OEMCrossAccountRole --assume-role-policy-document file://trust-policy.json
+aws iam put-role-policy --role-name OEMCrossAccountRole --policy-name OEMPermissionsPolicy --policy-document file://permissions-policy.json
+
+2.2 Configure Resource Policies for CloudWatch Logs
+
+To allow cross-account access to CloudWatch Logs, you need to update the resource policy.
+
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "OEMCrossAccountAccess",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::b234:root"
+      },
+      "Action": [
+        "logs:GetLogEvents",
+        "logs:DescribeLogGroups",
+        "logs:DescribeLogStreams",
+        "logs:FilterLogEvents"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+
+Apply the Resource Policy:
+
+aws logs put-resource-policy --policy-name OEMCrossAccountPolicy --policy-document file://logs-resource-policy.json
+
+Step 3: Configure Account B (Monitoring Account - b234)
+
+3.1 Create an IAM Role for OEM to Assume Roles in Member Accounts
+
+Create an IAM role that OEM will use to assume roles in member accounts (Account A).
+
+Trust Policy
+
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowOEMService",
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "oem.cloudwatch.amazonaws.com"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
+
+Permissions Policy
+
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "OEMAssumeRole",
+      "Effect": "Allow",
+      "Action": "sts:AssumeRole",
+      "Resource": "arn:aws:iam::a123:role/OEMCrossAccountRole"
+    }
+  ]
+}
+
+Create the IAM Role
+
+aws iam create-role --role-name OEMRole --assume-role-policy-document file://oem-trust-policy.json
+aws iam put-role-policy --role-name OEMRole --policy-name OEMAssumeRolePolicy --policy-document file://oem-permissions-policy.json
+
+3.2 Configure CloudWatch OEM
+
+In Account B, configure CloudWatch OEM to use the IAM role created.
+
+	•	Option 1: Use the AWS Management Console.
+	•	Navigate to CloudWatch > Settings > Cross-account observability.
+	•	Add Account A (a123) as a source account.
+	•	Specify the IAM role ARN: arn:aws:iam::b234:role/OEMRole.
+	•	Option 2: Use AWS CLI.
+
+aws oem register-source-account --source-account-id a123 --role-arn arn:aws:iam::b234:role/OEMRole
+
+Step 4: Deploy CloudFormation Templates Provided by OEM
+
+AWS OEM provides CloudFormation templates to automate the setup.
+
+4.1 Download the OEM CloudFormation Templates
+
+Templates can be found in the AWS documentation or GitHub repositories provided by AWS.
+
+	•	For Account A (a123): oem-source-account-template.yaml
+	•	For Account B (b234): oem-monitoring-account-template.yaml
+
+4.2 Deploy the Template in Account A
+
+	•	Using AWS CLI:
+
+aws cloudformation deploy --stack-name OEMSourceAccountStack --template-file oem-source-account-template.yaml --capabilities CAPABILITY_NAMED_IAM --parameter-overrides MonitoringAccountId=b234
+
+	•	Parameters:
+	•	MonitoringAccountId: The AWS Account ID of Account B.
+
+4.3 Deploy the Template in Account B
+
+aws cloudformation deploy --stack-name OEMMonitoringAccountStack --template-file oem-monitoring-account-template.yaml --capabilities CAPABILITY_NAMED_IAM
+
+Step 5: Verify the Setup and Test Cross-Account Access
+
+5.1 Verify in CloudWatch Console
+
+	•	In Account B (b234):
+	•	Go to the CloudWatch Console.
+	•	Navigate to Logs > Log Groups.
+	•	You should see log groups from Account A (a123).
+
+5.2 Use CloudWatch Logs Insights
+
+	•	Run queries against logs from Account A.
+
+5.3 Check Metrics
+
+	•	In the Metrics section, verify that metrics from Account A are visible.
+
+Best Practices and Explanations
+
+	•	Least Privilege Principle: Ensure IAM roles and policies grant only the permissions necessary.
+	•	Secure Trust Relationships:
+	•	Use specific ARNs instead of wildcards in trust policies.
+	•	Limit the principals who can assume roles.
+	•	Monitoring and Auditing:
+	•	Enable CloudTrail to monitor actions taken by IAM roles.
+	•	Regularly review IAM policies and resource policies.
+	•	Use AWS Managed Policies When Possible:
+	•	AWS provides managed policies that can simplify permissions management.
+	•	Version Control for Templates:
+	•	Keep your CloudFormation templates in version control (e.g., Git).
+	•	Testing in Non-Production Environments:
+	•	Test the setup in a staging environment before deploying to production.
+
+Conclusion
+
+By following these steps, you set up AWS CloudWatch Observability Manager to share logs and metrics from Account A (a123) to Account B (b234). This configuration allows centralized monitoring and observability, enabling you to use CloudWatch Logs Insights, dashboards, and alarms in the monitoring account for resources in the source account.
+
+Note: Always ensure that you update the account IDs (a123 and b234) with the actual AWS Account IDs. Replace placeholders in the IAM policies and commands accordingly.
