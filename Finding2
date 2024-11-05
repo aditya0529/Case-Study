@@ -1,0 +1,216 @@
+import boto3
+import logging
+import datetime
+import json
+from botocore.exceptions import ClientError
+
+# Configure logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# Initialize AWS clients
+iam_client = boto3.client('iam')
+securityhub_client = boto3.client('securityhub')
+sts_client = boto3.client('sts')
+
+def lambda_handler(event, context):
+    """
+    Entry point for the Lambda function.
+    Determines the event type and invokes the appropriate handler.
+    """
+    logger.info(f"Received event: {json.dumps(event)}")
+    if is_scheduled_event(event):
+        handle_scheduled_event()
+    elif is_access_key_deletion_event(event):
+        handle_access_key_deletion_event(event)
+    else:
+        logger.warning("Unhandled event type")
+
+def is_scheduled_event(event):
+    """Check if the event is a scheduled EventBridge event."""
+    return event.get('source') == 'aws.events'
+
+def is_access_key_deletion_event(event):
+    """Check if the event is an IAM DeleteAccessKey event."""
+    return event.get('detail', {}).get('eventName') == 'DeleteAccessKey'
+
+def handle_scheduled_event():
+    """Handle the scheduled event to detect old IAM access keys."""
+    users = list_all_users()
+    for user in users:
+        user_name = user['UserName']
+        access_keys = list_access_keys(user_name)
+        for access_key in access_keys:
+            key_id = access_key['AccessKeyId']
+            status = access_key['Status']
+            create_date = access_key['CreateDate']
+            if status == 'Active':
+                key_age_in_months = calculate_age_in_months(create_date)
+                if key_age_in_months >= 23:
+                    process_old_access_key(user_name, key_id, create_date)
+
+def handle_access_key_deletion_event(event):
+    """Handle the IAM DeleteAccessKey event to update findings."""
+    request_parameters = event.get('detail', {}).get('requestParameters', {})
+    access_key_id = request_parameters.get('accessKeyId')
+    user_name = request_parameters.get('userName')
+    if access_key_id and user_name:
+        finding_id = generate_finding_id(user_name, access_key_id)
+        update_finding_to_archived(finding_id)
+        create_informational_finding(user_name, access_key_id, finding_id)
+    else:
+        logger.error("AccessKeyId or UserName not found in event")
+
+def list_all_users():
+    """Retrieve all IAM users."""
+    users = []
+    paginator = iam_client.get_paginator('list_users')
+    for page in paginator.paginate():
+        users.extend(page['Users'])
+    return users
+
+def list_access_keys(user_name):
+    """Retrieve all access keys for a given IAM user."""
+    access_keys = []
+    paginator = iam_client.get_paginator('list_access_keys')
+    for page in paginator.paginate(UserName=user_name):
+        access_keys.extend(page['AccessKeyMetadata'])
+    return access_keys
+
+def calculate_age_in_months(create_date):
+    """Calculate the age of the access key in months."""
+    now = datetime.datetime.utcnow().replace(tzinfo=create_date.tzinfo)
+    delta = now - create_date
+    return delta.days // 30  # Approximate months
+
+def process_old_access_key(user_name, access_key_id, create_date):
+    """Process an old access key by creating a finding or logging if it exists."""
+    finding_id = generate_finding_id(user_name, access_key_id)
+    existing_finding = get_existing_finding_by_id(finding_id)
+    if existing_finding:
+        logger.info(f"Finding already exists for access key {access_key_id}, user {user_name}")
+    else:
+        logger.info(f"Creating finding for access key {access_key_id}, user {user_name}")
+        create_finding(user_name, access_key_id, create_date, finding_id)
+
+def get_existing_finding_by_id(finding_id):
+    """Check if a finding already exists in Security Hub."""
+    try:
+        response = securityhub_client.get_findings(
+            Filters={
+                'Id': [{'Value': finding_id, 'Comparison': 'EQUALS'}]
+            }
+        )
+        return response['Findings']
+    except ClientError as e:
+        logger.error(f"Error retrieving findings: {e}")
+        return []
+
+def create_finding(user_name, access_key_id, create_date, finding_id):
+    """Create a new finding in Security Hub for an old access key."""
+    account_id = get_account_id()
+    now = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc).isoformat()
+    create_date_iso = create_date.isoformat()
+    finding = {
+        'SchemaVersion': '2018-10-08',
+        'Id': finding_id,
+        'ProductArn': f"arn:aws:securityhub:{boto3.session.Session().region_name}:{account_id}:product/{account_id}/default",
+        'GeneratorId': 'iam-access-key-age-checker',
+        'AwsAccountId': account_id,
+        'Types': ['Software and Configuration Checks/Industry and Regulatory Standards'],
+        'CreatedAt': now,
+        'UpdatedAt': now,
+        'Severity': {'Label': 'MEDIUM'},
+        'Title': f'IAM Access Key older than 23 months for user {user_name}',
+        'Description': f'Access key {access_key_id} for IAM user {user_name} is active and older than 23 months.',
+        'Resources': [
+            {
+                'Type': 'AwsIamAccessKey',
+                'Id': finding_id,
+                'Region': boto3.session.Session().region_name,
+                'Details': {
+                    'AwsIamAccessKey': {
+                        'UserName': user_name,
+                        'Status': 'Active',
+                        'CreatedAt': create_date_iso
+                    }
+                }
+            }
+        ],
+        'Compliance': {'Status': 'FAILED'},
+        'Workflow': {'Status': 'NEW'},
+        'RecordState': 'ACTIVE',
+        'ProductFields': {'AccessKeyId': access_key_id}
+    }
+    try:
+        securityhub_client.batch_import_findings(Findings=[finding])
+        logger.info(f"Finding created for access key {access_key_id}, user {user_name}")
+    except ClientError as e:
+        logger.error(f"Error creating finding: {e}")
+
+def update_finding_to_archived(finding_id):
+    """Update an existing finding to archived status."""
+    account_id = get_account_id()
+    try:
+        securityhub_client.batch_update_findings(
+            FindingIdentifiers=[
+                {
+                    'Id': finding_id,
+                    'ProductArn': f"arn:aws:securityhub:{boto3.session.Session().region_name}:{account_id}:product/{account_id}/default"
+                }
+            ],
+            Workflow={'Status': 'RESOLVED'},
+            RecordState='ARCHIVED'
+        )
+        logger.info(f"Finding {finding_id} updated to archived")
+    except ClientError as e:
+        logger.error(f"Error updating finding: {e}")
+
+def create_informational_finding(user_name, access_key_id, finding_id):
+    """Create an informational finding for a deleted access key."""
+    account_id = get_account_id()
+    now = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc).isoformat()
+    finding = {
+        'SchemaVersion': '2018-10-08',
+        'Id': finding_id + "-deleted",
+        'ProductArn': f"arn:aws:securityhub:{boto3.session.Session().region_name}:{account_id}:product/{account_id}/default",
+        'GeneratorId': 'iam-access-key-age-checker',
+        'AwsAccountId': account_id,
+        'Types': ['Software and Configuration Checks/Industry and Regulatory Standards'],
+        'CreatedAt': now,
+        'UpdatedAt': now,
+        'Severity': {'Label': 'INFORMATIONAL'},
+        'Title': f'IAM Access Key deleted for user {user_name}',
+        'Description': f'Access key {access_key_id} for IAM user {user_name} has been deleted.',
+        'Resources': [
+            {
+                'Type': 'AwsIamAccessKey',
+                'Id': finding_id,
+                'Region': boto3.session.Session().region_name,
+                'Details': {
+                    'AwsIamAccessKey': {
+                        'UserName': user_name,
+                        'Status': 'Inactive'
+                    }
+                }
+            }
+        ],
+        'Compliance': {'Status': 'NOT_AVAILABLE'},
+        'Workflow': {'Status': 'NEW'},
+        'RecordState': 'ACTIVE',
+        'ProductFields': {'AccessKeyId': access_key_id}
+    }
+    try:
+        securityhub_client.batch_import_findings(Findings=[finding])
+        logger.info(f"Informational finding created for deleted access key {access_key_id}, user {user_name}")
+    except ClientError as e:
+        logger.error(f"Error creating informational finding: {e}")
+
+def get_account_id():
+    """Retrieve the AWS account ID."""
+    return sts_client.get_caller_identity()['Account']
+
+def generate_finding_id(user_name, access_key_id):
+    """Generate a unique finding ID."""
+    account_id = get_account_id()
+    return f"arn:aws:iam::{account_id}:user/{user_name}/accesskey/{access_key_id}"
