@@ -1,0 +1,422 @@
+Here is the complete solution to create an AWS Lambda function that detects IAM user access keys older than 23 months and reports findings to AWS Security Hub. The solution includes the Lambda function code, IAM role, and a CloudFormation template that deploys all the necessary resources. Best practices have been followed, with methods extracted for readability and the handler kept simple.
+
+Lambda Function Code
+
+import boto3
+import logging
+import datetime
+import json
+from botocore.exceptions import ClientError
+
+# Configure logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# Initialize AWS clients
+iam_client = boto3.client('iam')
+securityhub_client = boto3.client('securityhub')
+sts_client = boto3.client('sts')
+
+def lambda_handler(event, context):
+    """
+    Entry point for the Lambda function.
+    Determines the event type and invokes the appropriate handler.
+    """
+    logger.info(f"Received event: {json.dumps(event)}")
+    if is_scheduled_event(event):
+        handle_scheduled_event()
+    elif is_access_key_deletion_event(event):
+        handle_access_key_deletion_event(event)
+    else:
+        logger.warning("Unhandled event type")
+
+def is_scheduled_event(event):
+    """Check if the event is a scheduled EventBridge event."""
+    return event.get('source') == 'aws.events'
+
+def is_access_key_deletion_event(event):
+    """Check if the event is an IAM DeleteAccessKey event."""
+    return event.get('detail', {}).get('eventName') == 'DeleteAccessKey'
+
+def handle_scheduled_event():
+    """Handle the scheduled event to detect old IAM access keys."""
+    users = list_all_users()
+    for user in users:
+        user_name = user['UserName']
+        access_keys = list_access_keys(user_name)
+        for access_key in access_keys:
+            key_id = access_key['AccessKeyId']
+            status = access_key['Status']
+            create_date = access_key['CreateDate']
+            if status == 'Active':
+                key_age_in_months = calculate_age_in_months(create_date)
+                if key_age_in_months >= 23:
+                    process_old_access_key(user_name, key_id, create_date)
+
+def handle_access_key_deletion_event(event):
+    """Handle the IAM DeleteAccessKey event to update findings."""
+    request_parameters = event.get('detail', {}).get('requestParameters', {})
+    access_key_id = request_parameters.get('accessKeyId')
+    user_name = request_parameters.get('userName')
+    if access_key_id and user_name:
+        finding_id = generate_finding_id(user_name, access_key_id)
+        update_finding_to_archived(finding_id)
+        create_informational_finding(user_name, access_key_id, finding_id)
+    else:
+        logger.error("AccessKeyId or UserName not found in event")
+
+def list_all_users():
+    """Retrieve all IAM users."""
+    users = []
+    paginator = iam_client.get_paginator('list_users')
+    for page in paginator.paginate():
+        users.extend(page['Users'])
+    return users
+
+def list_access_keys(user_name):
+    """Retrieve all access keys for a given IAM user."""
+    access_keys = []
+    paginator = iam_client.get_paginator('list_access_keys')
+    for page in paginator.paginate(UserName=user_name):
+        access_keys.extend(page['AccessKeyMetadata'])
+    return access_keys
+
+def calculate_age_in_months(create_date):
+    """Calculate the age of the access key in months."""
+    now = datetime.datetime.utcnow().replace(tzinfo=create_date.tzinfo)
+    delta = now - create_date
+    return delta.days // 30  # Approximate months
+
+def process_old_access_key(user_name, access_key_id, create_date):
+    """Process an old access key by creating a finding or logging if it exists."""
+    finding_id = generate_finding_id(user_name, access_key_id)
+    existing_finding = get_existing_finding_by_id(finding_id)
+    if existing_finding:
+        logger.info(f"Finding already exists for access key {access_key_id}, user {user_name}")
+    else:
+        logger.info(f"Creating finding for access key {access_key_id}, user {user_name}")
+        create_finding(user_name, access_key_id, create_date, finding_id)
+
+def get_existing_finding_by_id(finding_id):
+    """Check if a finding already exists in Security Hub."""
+    try:
+        response = securityhub_client.get_findings(
+            Filters={
+                'Id': [{'Value': finding_id, 'Comparison': 'EQUALS'}]
+            }
+        )
+        return response['Findings']
+    except ClientError as e:
+        logger.error(f"Error retrieving findings: {e}")
+        return []
+
+def create_finding(user_name, access_key_id, create_date, finding_id):
+    """Create a new finding in Security Hub for an old access key."""
+    account_id = get_account_id()
+    now = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc).isoformat()
+    create_date_iso = create_date.isoformat()
+    finding = {
+        'SchemaVersion': '2018-10-08',
+        'Id': finding_id,
+        'ProductArn': f"arn:aws:securityhub:{boto3.session.Session().region_name}:{account_id}:product/{account_id}/default",
+        'GeneratorId': 'iam-access-key-age-checker',
+        'AwsAccountId': account_id,
+        'Types': ['Software and Configuration Checks/Industry and Regulatory Standards'],
+        'CreatedAt': now,
+        'UpdatedAt': now,
+        'Severity': {'Label': 'MEDIUM'},
+        'Title': f'IAM Access Key older than 23 months for user {user_name}',
+        'Description': f'Access key {access_key_id} for IAM user {user_name} is active and older than 23 months.',
+        'Resources': [
+            {
+                'Type': 'AwsIamAccessKey',
+                'Id': finding_id,
+                'Region': boto3.session.Session().region_name,
+                'Details': {
+                    'AwsIamAccessKey': {
+                        'UserName': user_name,
+                        'Status': 'Active',
+                        'CreatedAt': create_date_iso
+                    }
+                }
+            }
+        ],
+        'Compliance': {'Status': 'FAILED'},
+        'Workflow': {'Status': 'NEW'},
+        'RecordState': 'ACTIVE',
+        'ProductFields': {'AccessKeyId': access_key_id}
+    }
+    try:
+        securityhub_client.batch_import_findings(Findings=[finding])
+        logger.info(f"Finding created for access key {access_key_id}, user {user_name}")
+    except ClientError as e:
+        logger.error(f"Error creating finding: {e}")
+
+def update_finding_to_archived(finding_id):
+    """Update an existing finding to archived status."""
+    account_id = get_account_id()
+    try:
+        securityhub_client.batch_update_findings(
+            FindingIdentifiers=[
+                {
+                    'Id': finding_id,
+                    'ProductArn': f"arn:aws:securityhub:{boto3.session.Session().region_name}:{account_id}:product/{account_id}/default"
+                }
+            ],
+            Workflow={'Status': 'RESOLVED'},
+            RecordState='ARCHIVED'
+        )
+        logger.info(f"Finding {finding_id} updated to archived")
+    except ClientError as e:
+        logger.error(f"Error updating finding: {e}")
+
+def create_informational_finding(user_name, access_key_id, finding_id):
+    """Create an informational finding for a deleted access key."""
+    account_id = get_account_id()
+    now = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc).isoformat()
+    finding = {
+        'SchemaVersion': '2018-10-08',
+        'Id': finding_id + "-deleted",
+        'ProductArn': f"arn:aws:securityhub:{boto3.session.Session().region_name}:{account_id}:product/{account_id}/default",
+        'GeneratorId': 'iam-access-key-age-checker',
+        'AwsAccountId': account_id,
+        'Types': ['Software and Configuration Checks/Industry and Regulatory Standards'],
+        'CreatedAt': now,
+        'UpdatedAt': now,
+        'Severity': {'Label': 'INFORMATIONAL'},
+        'Title': f'IAM Access Key deleted for user {user_name}',
+        'Description': f'Access key {access_key_id} for IAM user {user_name} has been deleted.',
+        'Resources': [
+            {
+                'Type': 'AwsIamAccessKey',
+                'Id': finding_id,
+                'Region': boto3.session.Session().region_name,
+                'Details': {
+                    'AwsIamAccessKey': {
+                        'UserName': user_name,
+                        'Status': 'Inactive'
+                    }
+                }
+            }
+        ],
+        'Compliance': {'Status': 'NOT_AVAILABLE'},
+        'Workflow': {'Status': 'NEW'},
+        'RecordState': 'ACTIVE',
+        'ProductFields': {'AccessKeyId': access_key_id}
+    }
+    try:
+        securityhub_client.batch_import_findings(Findings=[finding])
+        logger.info(f"Informational finding created for deleted access key {access_key_id}, user {user_name}")
+    except ClientError as e:
+        logger.error(f"Error creating informational finding: {e}")
+
+def get_account_id():
+    """Retrieve the AWS account ID."""
+    return sts_client.get_caller_identity()['Account']
+
+def generate_finding_id(user_name, access_key_id):
+    """Generate a unique finding ID."""
+    account_id = get_account_id()
+    return f"arn:aws:iam::{account_id}:user/{user_name}/accesskey/{access_key_id}"
+
+IAM Role for Lambda Function
+
+The following IAM policy provides the necessary permissions for the Lambda function:
+
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "IAMListAndRead",
+      "Effect": "Allow",
+      "Action": [
+        "iam:ListUsers",
+        "iam:ListAccessKeys"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "SecurityHubAccess",
+      "Effect": "Allow",
+      "Action": [
+        "securityhub:BatchImportFindings",
+        "securityhub:GetFindings",
+        "securityhub:BatchUpdateFindings"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "STSGetCallerIdentity",
+      "Effect": "Allow",
+      "Action": "sts:GetCallerIdentity",
+      "Resource": "*"
+    },
+    {
+      "Sid": "CloudWatchLogs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+
+CloudFormation Template
+
+Below is the CloudFormation template that sets up the Lambda function, IAM role, and EventBridge rules:
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Lambda function to detect old IAM access keys and report to Security Hub
+
+Parameters:
+  LambdaFunctionName:
+    Type: String
+    Default: OldAccessKeyChecker
+    Description: Name of the Lambda function
+
+Resources:
+  OldAccessKeyCheckerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${LambdaFunctionName}-Role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: LambdaExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: IAMListAndRead
+                Effect: Allow
+                Action:
+                  - 'iam:ListUsers'
+                  - 'iam:ListAccessKeys'
+                Resource: '*'
+              - Sid: SecurityHubAccess
+                Effect: Allow
+                Action:
+                  - 'securityhub:BatchImportFindings'
+                  - 'securityhub:GetFindings'
+                  - 'securityhub:BatchUpdateFindings'
+                Resource: '*'
+              - Sid: STSGetCallerIdentity
+                Effect: Allow
+                Action:
+                  - 'sts:GetCallerIdentity'
+                Resource: '*'
+              - Sid: CloudWatchLogs
+                Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: '*'
+  OldAccessKeyCheckerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref LambdaFunctionName
+      Handler: index.lambda_handler
+      Role: !GetAtt OldAccessKeyCheckerRole.Arn
+      Runtime: python3.9
+      Timeout: 300
+      Code:
+        ZipFile: |
+          (Place the Lambda function code here or refer to an S3 bucket)
+      Environment:
+        Variables:
+          AWS_REGION: !Ref 'AWS::Region'
+  OldAccessKeyCheckerScheduledRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${LambdaFunctionName}-ScheduledRule'
+      ScheduleExpression: 'rate(1 day)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt OldAccessKeyCheckerFunction.Arn
+          Id: TargetFunctionV1
+      Description: 'Triggers Lambda function daily to check for old IAM access keys'
+  OldAccessKeyCheckerDeleteAccessKeyRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${LambdaFunctionName}-DeleteAccessKeyRule'
+      EventPattern:
+        source:
+          - aws.iam
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - iam.amazonaws.com
+          eventName:
+            - DeleteAccessKey
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt OldAccessKeyCheckerFunction.Arn
+          Id: TargetFunctionV2
+      Description: 'Triggers Lambda function when an IAM access key is deleted'
+  PermissionForEventsToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OldAccessKeyCheckerFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt OldAccessKeyCheckerScheduledRule.Arn
+  PermissionForEventsToInvokeLambdaOnDelete:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OldAccessKeyCheckerFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt OldAccessKeyCheckerDeleteAccessKeyRule.Arn
+
+Note: Replace (Place the Lambda function code here or refer to an S3 bucket) with your Lambda function code or reference an S3 bucket where the code is stored.
+
+Best Practices Followed
+
+	•	Modular Code: Functions have been extracted for each logical operation to keep the handler clean and readable.
+	•	Error Handling: Exceptions are caught and logged appropriately.
+	•	Logging: The logging module is used for logging information and errors.
+	•	Least Privilege: The IAM role provides only the necessary permissions required by the Lambda function.
+	•	Pagination: AWS SDK pagination is used when listing IAM users and access keys.
+	•	Time Zone Awareness: Time calculations consider time zones to prevent errors.
+
+Deployment Instructions
+
+	1.	Upload Lambda Code:
+	•	Save the Lambda function code in a file named index.py.
+	•	Package the code into a ZIP file named OldAccessKeyChecker.zip.
+	2.	S3 Upload (Optional):
+	•	Upload OldAccessKeyChecker.zip to an S3 bucket if you prefer to reference it in the CloudFormation template.
+	3.	Update CloudFormation Template:
+	•	If using S3, modify the Code section in the Lambda function resource to reference the S3 bucket and key.
+	•	Example:
+
+Code:
+  S3Bucket: your-s3-bucket-name
+  S3Key: OldAccessKeyChecker.zip
+
+
+	4.	Deploy the CloudFormation Stack:
+	•	Use the AWS Management Console, AWS CLI, or AWS SDKs to deploy the CloudFormation template.
+	•	Example CLI command:
+
+aws cloudformation deploy --template-file template.yaml --stack-name OldAccessKeyCheckerStack --capabilities CAPABILITY_NAMED_IAM
+
+
+	5.	Verify Deployment:
+	•	Ensure that the Lambda function, IAM role, and EventBridge rules have been created.
+	•	Check the CloudWatch Logs for any errors during execution.
+
+Conclusion
+
+This solution provides an automated way to monitor IAM user access keys that are older than 23 months and report findings to AWS Security Hub. By following best practices and using AWS services effectively, we ensure the code is maintainable, secure, and efficient.
+
+If you have any questions or need further assistance, feel free to ask!
