@@ -108,7 +108,7 @@ def finding_exists(finding_id, product_arn):
             Filters={
                 'Id': [{'Value': finding_id, 'Comparison': 'EQUALS'}],
                 'ProductArn': [{'Value': product_arn, 'Comparison': 'EQUALS'}],
-                'SeverityLabel': [{'Value': 'HIGH', 'Comparison': 'EQUALS'}],
+                'SeverityLabel': [{'Value': SEVERITY_THRESHOLD, 'Comparison': 'EQUALS'}],
                 'ComplianceStatus': [{'Value': 'FAILED', 'Comparison': 'EQUALS'}],
                 'WorkflowStatus': [{'Value': 'NEW', 'Comparison': 'EQUALS'}],
                 'RecordState': [{'Value': 'ACTIVE', 'Comparison': 'EQUALS'}]
@@ -254,6 +254,7 @@ def handle_scheduled_event(account_id, region, product_arn):
 def lambda_handler(event, context):
     """Main Lambda handler for scheduled checks and access key deletion events."""
     logger.info("Starting IAM access key compliance check.")
+    logger.info(f"Received event: {event}")  # Log the event for testing purposes
     account_id, region = get_account_id_and_region(context)
     product_arn = f"arn:aws:securityhub:{region}:{account_id}:product/{account_id}/default"
 
