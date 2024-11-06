@@ -101,20 +101,24 @@ def construct_finding(user_name, key, key_age_days, account_id, region, product_
     return finding
 
 def finding_exists(finding_id, product_arn):
-    """Check if a finding with the specified ID and ProductArn already exists in Security Hub."""
-    logger.info(f"Checking if finding {finding_id} exists in Security Hub.")
+    """Check if a matching finding already exists in Security Hub."""
+    logger.info(f"Checking if finding {finding_id} exists in Security Hub with matching severity and compliance status.")
     try:
         response = securityhub_client.get_findings(
             Filters={
                 'Id': [{'Value': finding_id, 'Comparison': 'EQUALS'}],
-                'ProductArn': [{'Value': product_arn, 'Comparison': 'EQUALS'}]
+                'ProductArn': [{'Value': product_arn, 'Comparison': 'EQUALS'}],
+                'SeverityLabel': [{'Value': 'HIGH', 'Comparison': 'EQUALS'}],
+                'ComplianceStatus': [{'Value': 'FAILED', 'Comparison': 'EQUALS'}],
+                'WorkflowStatus': [{'Value': 'NEW', 'Comparison': 'EQUALS'}],
+                'RecordState': [{'Value': 'ACTIVE', 'Comparison': 'EQUALS'}]
             }
         )
         exists = len(response['Findings']) > 0
         if exists:
-            logger.info(f"Finding {finding_id} already exists in Security Hub.")
+            logger.info(f"Matching finding {finding_id} already exists in Security Hub.")
         else:
-            logger.info(f"Finding {finding_id} does not exist in Security Hub.")
+            logger.info(f"No matching finding {finding_id} found in Security Hub.")
         return exists
     except ClientError as e:
         logger.error(f"Error checking existence of finding {finding_id}: {e}")
@@ -141,7 +145,7 @@ def get_non_compliant_findings(rotation_threshold_date, account_id, region, prod
                         non_compliant_findings.append(finding)
                         logger.info(f"Added finding for user {user_name}, key {key_id}.")
                     else:
-                        logger.info(f"Finding {finding_id} already exists. Skipping.")
+                        logger.info(f"Finding {finding_id} already exists with matching attributes. Skipping.")
         except ClientError as e:
             logger.error(f"Error retrieving access keys for user {user_name}: {e}")
             continue
@@ -175,7 +179,7 @@ def update_finding_to_new_and_archived(finding_id, product_arn):
         )
         logger.info(f"Finding {finding_id} updated to NEW and ARCHIVED.")
     except ClientError as e:
-        logger.error(f"Error updating finding {finding_id} to NEW: {e}")
+        logger.error(f"Error updating finding {finding_id} to NEW and ARCHIVED: {e}")
 
 def create_access_key_deletion_finding(user_name, access_key_id, account_id, region, product_arn):
     """Create an informational finding to document that an access key was deleted."""
