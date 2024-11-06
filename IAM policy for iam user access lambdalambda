@@ -1,0 +1,31 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "iam:ListUsers",
+                "iam:ListAccessKeys"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "securityhub:BatchImportFindings",
+                "securityhub:BatchUpdateFindings",
+                "securityhub:GetFindings"
+            ],
+            "Resource": "arn:aws:securityhub:<region>:<account-id>:product/<account-id>/default"
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "logs:CreateLogGroup",
+                "logs:CreateLogStream",
+                "logs:PutLogEvents"
+            ],
+            "Resource": "arn:aws:logs:<region>:<account-id>:log-group:/aws/lambda/*"
+        }
+    ]
+}
