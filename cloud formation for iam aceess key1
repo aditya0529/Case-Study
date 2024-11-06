@@ -1,0 +1,490 @@
+Certainly! Below is a comprehensive AWS CloudFormation template that sets up:
+
+The Lambda function with the provided code.
+The IAM Role for the Lambda function with the necessary permissions, following the principle of least privilege.
+An EventBridge Scheduled Rule to trigger the Lambda function daily.
+An EventBridge Rule to trigger the Lambda function when an IAM access key is deleted.
+The template uses best practices and includes comments for clarity.
+
+yaml
+Copy code
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  AWS CloudFormation template to deploy a Lambda function that checks IAM access key compliance,
+  along with the necessary IAM role and EventBridge rules.
+
+Parameters:
+  RotationThresholdMonths:
+    Type: Number
+    Default: 23
+    Description: The number of months after which an IAM access key is considered non-compliant.
+  SeverityThreshold:
+    Type: String
+    Default: HIGH
+    AllowedValues:
+      - LOW
+      - MEDIUM
+      - HIGH
+      - CRITICAL
+    Description: The severity level for non-compliant findings.
+
+Resources:
+  # IAM Role for the Lambda function
+  IAMAccessKeyComplianceLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: IAMAccessKeyComplianceLambdaRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: IAMAccessKeyCompliancePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Permissions for IAM operations
+              - Effect: Allow
+                Action:
+                  - iam:ListUsers
+                  - iam:ListAccessKeys
+                Resource: '*'
+              # Permissions for Security Hub
+              - Effect: Allow
+                Action:
+                  - securityhub:BatchImportFindings
+                  - securityhub:BatchUpdateFindings
+                  - securityhub:GetFindings
+                Resource: '*'
+
+  # Lambda Function
+  IAMAccessKeyComplianceLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: IAMAccessKeyComplianceFunction
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      Role: !GetAtt IAMAccessKeyComplianceLambdaRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          ROTATION_THRESHOLD_MONTHS: !Ref RotationThresholdMonths
+          SEVERITY_THRESHOLD: !Ref SeverityThreshold
+      Code:
+        ZipFile: |
+          import boto3
+          import logging
+          import os
+          from datetime import datetime, timezone
+          from dateutil.relativedelta import relativedelta
+          from botocore.exceptions import ClientError
+          
+          # Initialize AWS clients
+          iam_client = boto3.client('iam')
+          securityhub_client = boto3.client('securityhub')
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          # Read configuration from environment variables
+          ROTATION_THRESHOLD_MONTHS = int(os.environ.get('ROTATION_THRESHOLD_MONTHS', '23'))
+          SEVERITY_THRESHOLD = os.environ.get('SEVERITY_THRESHOLD', 'HIGH')
+          
+          # ---------- Helper Functions ----------
+          
+          def get_account_id_and_region(context):
+              """Extract AWS account ID and region from the Lambda context."""
+              logger.info("Extracting AWS account ID and region from the context.")
+              arn_parts = context.invoked_function_arn.split(":")
+              region = arn_parts[3]
+              account_id = arn_parts[4]
+              logger.info(f"Extracted account ID: {account_id} and region: {region}.")
+              return account_id, region
+          
+          def list_all_users():
+              """List all IAM users."""
+              logger.info("Listing all IAM users.")
+              users = []
+              paginator = iam_client.get_paginator('list_users')
+              for page in paginator.paginate():
+                  users.extend(page['Users'])
+              logger.info(f"Total IAM users retrieved: {len(users)}.")
+              return users
+          
+          def list_access_keys_for_user(user_name):
+              """List all access keys for a given IAM user."""
+              logger.info(f"Listing access keys for user: {user_name}.")
+              access_keys = []
+              key_paginator = iam_client.get_paginator('list_access_keys')
+              for key_page in key_paginator.paginate(UserName=user_name):
+                  access_keys.extend(key_page['AccessKeyMetadata'])
+              logger.info(f"User {user_name} has {len(access_keys)} access keys.")
+              return access_keys
+          
+          def is_key_non_compliant(key, rotation_threshold_date):
+              """Check if an access key is non-compliant."""
+              non_compliant = key['Status'] == 'Active' and key['CreateDate'] < rotation_threshold_date
+              key_id = key['AccessKeyId']
+              if non_compliant:
+                  logger.debug(f"Access key {key_id} is non-compliant.")
+              else:
+                  logger.debug(f"Access key {key_id} is compliant.")
+              return non_compliant
+          
+          def construct_finding(user_name, key, key_age_days, account_id, region, product_arn):
+              """Construct a Security Hub finding for a non-compliant access key."""
+              logger.info(f"Constructing finding for user: {user_name}, key ID: {key['AccessKeyId']}.")
+              key_id = key['AccessKeyId']
+              finding = {
+                  "SchemaVersion": "2018-10-08",
+                  "Id": f"{user_name}/{key_id}",
+                  "ProductArn": product_arn,
+                  "GeneratorId": "iam-access-key-rotation-check",
+                  "AwsAccountId": account_id,
+                  "Types": ["Software and Configuration Checks/AWS Security Best Practices"],
+                  "CreatedAt": datetime.now(timezone.utc).isoformat(),
+                  "UpdatedAt": datetime.now(timezone.utc).isoformat(),
+                  "Severity": {"Label": SEVERITY_THRESHOLD},
+                  "Title": "IAM Access Key Rotation Best Practice Violation",
+                  "Description": (
+                      f"Active IAM access key {key_id} for user {user_name} is older than "
+                      f"{ROTATION_THRESHOLD_MONTHS} months (Key Age: {key_age_days} days)."
+                  ),
+                  "Resources": [
+                      {
+                          "Type": "AwsIamAccessKey",
+                          "Id": f"arn:aws:iam::{account_id}:user/{user_name}",
+                          "Partition": "aws",
+                          "Region": region,
+                          "Details": {
+                              "AwsIamAccessKey": {
+                                  "UserName": user_name,
+                                  "Status": key['Status'],
+                                  "CreatedAt": key['CreateDate'].replace(tzinfo=timezone.utc).isoformat(),
+                                  "AccessKeyId": key_id
+                              }
+                          }
+                      }
+                  ],
+                  "Compliance": {"Status": "FAILED"},
+                  "Workflow": {"Status": "NEW"},
+                  "RecordState": "ACTIVE"
+              }
+              logger.debug(f"Constructed finding: {finding}.")
+              return finding
+          
+          def finding_exists(finding_id, product_arn):
+              """Check if a matching finding already exists in Security Hub."""
+              logger.info(f"Checking if finding {finding_id} exists in Security Hub with matching severity and compliance status.")
+              try:
+                  response = securityhub_client.get_findings(
+                      Filters={
+                          'Id': [{'Value': finding_id, 'Comparison': 'EQUALS'}],
+                          'ProductArn': [{'Value': product_arn, 'Comparison': 'EQUALS'}],
+                          'SeverityLabel': [{'Value': SEVERITY_THRESHOLD, 'Comparison': 'EQUALS'}],
+                          'ComplianceStatus': [{'Value': 'FAILED', 'Comparison': 'EQUALS'}],
+                          'WorkflowStatus': [{'Value': 'NEW', 'Comparison': 'EQUALS'}],
+                          'RecordState': [{'Value': 'ACTIVE', 'Comparison': 'EQUALS'}]
+                      }
+                  )
+                  exists = len(response['Findings']) > 0
+                  if exists:
+                      logger.info(f"Matching finding {finding_id} already exists in Security Hub.")
+                  else:
+                      logger.info(f"No matching finding {finding_id} found in Security Hub.")
+                  return exists
+              except ClientError as e:
+                  logger.error(f"Error checking existence of finding {finding_id}: {e}")
+                  return False
+          
+          def get_non_compliant_findings(rotation_threshold_date, account_id, region, product_arn):
+              """Retrieve non-compliant IAM access keys and construct findings."""
+              logger.info("Retrieving non-compliant IAM access keys.")
+              non_compliant_findings = []
+              users = list_all_users()
+              for user in users:
+                  user_name = user['UserName']
+                  logger.info(f"Processing user: {user_name}.")
+                  try:
+                      access_keys = list_access_keys_for_user(user_name)
+                      for key in access_keys:
+                          if is_key_non_compliant(key, rotation_threshold_date):
+                              key_id = key['AccessKeyId']
+                              key_age_days = (datetime.now(timezone.utc) - key['CreateDate']).days
+                              finding_id = f"{user_name}/{key_id}"
+          
+                              if not finding_exists(finding_id, product_arn):
+                                  finding = construct_finding(user_name, key, key_age_days, account_id, region, product_arn)
+                                  non_compliant_findings.append(finding)
+                                  logger.info(f"Added finding for user {user_name}, key {key_id}.")
+                              else:
+                                  logger.info(f"Finding {finding_id} already exists with matching attributes. Skipping.")
+                  except ClientError as e:
+                      logger.error(f"Error retrieving access keys for user {user_name}: {e}")
+                      continue
+              logger.info(f"Total non-compliant findings to send: {len(non_compliant_findings)}.")
+              return non_compliant_findings
+          
+          def send_findings_to_security_hub(findings):
+              """Send the non-compliant findings to AWS Security Hub."""
+              if not findings:
+                  logger.info("No new findings to send to Security Hub.")
+                  return
+          
+              batch_size = 100
+              logger.info(f"Sending {len(findings)} findings to Security Hub in batches of {batch_size}.")
+              for i in range(0, len(findings), batch_size):
+                  batch = findings[i:i+batch_size]
+                  try:
+                      securityhub_client.batch_import_findings(Findings=batch)
+                      logger.info(f"Successfully sent batch of {len(batch)} findings to Security Hub.")
+                  except ClientError as e:
+                      logger.error(f"Error sending findings to Security Hub: {e}")
+          
+          def update_finding_to_new_and_archived(finding_id, product_arn):
+              """Update the Security Hub finding to NEW and ARCHIVED."""
+              logger.info(f"Updating finding {finding_id} to NEW and ARCHIVED.")
+              try:
+                  securityhub_client.batch_update_findings(
+                      FindingIdentifiers=[{'Id': finding_id, 'ProductArn': product_arn}],
+                      Workflow={'Status': 'NEW'},
+                      RecordState='ARCHIVED'
+                  )
+                  logger.info(f"Finding {finding_id} updated to NEW and ARCHIVED.")
+              except ClientError as e:
+                  logger.error(f"Error updating finding {finding_id} to NEW and ARCHIVED: {e}")
+          
+          def create_access_key_deletion_finding(user_name, access_key_id, account_id, region, product_arn):
+              """Create an informational finding to document that an access key was deleted."""
+              logger.info(f"Creating deletion finding for access key {access_key_id} of user {user_name}.")
+              finding_id = f"{user_name}/{access_key_id}-deletion-proof"
+              finding = {
+                  "SchemaVersion": "2018-10-08",
+                  "Id": finding_id,
+                  "ProductArn": product_arn,
+                  "GeneratorId": "iam-access-key-deletion-proof",
+                  "AwsAccountId": account_id,
+                  "Types": ["Effects/Data Exposure"],
+                  "CreatedAt": datetime.now(timezone.utc).isoformat(),
+                  "UpdatedAt": datetime.now(timezone.utc).isoformat(),
+                  "Severity": {"Label": "INFORMATIONAL"},
+                  "Title": "IAM Access Key Deletion Proof",
+                  "Description": f"IAM access key {access_key_id} for user {user_name} has been deleted.",
+                  "Resources": [
+                      {
+                          "Type": "AwsIamAccessKey",
+                          "Id": f"arn:aws:iam::{account_id}:user/{user_name}",
+                          "Partition": "aws",
+                          "Region": region,
+                          "Details": {
+                              "AwsIamAccessKey": {
+                                  "UserName": user_name,
+                                  "Status": "Deleted",
+                                  "AccessKeyId": access_key_id
+                              }
+                          }
+                      }
+                  ],
+                  "Compliance": {"Status": "NOT_AVAILABLE"},
+                  "Workflow": {"Status": "NEW"},
+                  "RecordState": "ACTIVE"
+              }
+              try:
+                  securityhub_client.batch_import_findings(Findings=[finding])
+                  logger.info(f"Deletion finding {finding_id} created in Security Hub.")
+              except ClientError as e:
+                  logger.error(f"Error creating deletion finding {finding_id}: {e}")
+          
+          def handle_delete_access_key_event(event, account_id, region, product_arn):
+              """Handle IAM access key deletion events."""
+              logger.info("Handling DeleteAccessKey event.")
+              try:
+                  user_name = event['detail']['requestParameters'].get('userName') or event['detail']['userIdentity']['userName']
+                  access_key_id = event['detail']['requestParameters']['accessKeyId']
+                  finding_id = f"{user_name}/{access_key_id}"
+                  logger.info(f"Access key {access_key_id} for user {user_name} was deleted.")
+          
+                  # Update existing finding to NEW and ARCHIVED
+                  update_finding_to_new_and_archived(finding_id, product_arn)
+          
+                  # Create deletion finding
+                  create_access_key_deletion_finding(user_name, access_key_id, account_id, region, product_arn)
+          
+              except Exception as e:
+                  logger.error(f"Error handling DeleteAccessKey event: {e}")
+          
+          def handle_scheduled_event(account_id, region, product_arn):
+              """Handle scheduled events for daily non-compliance checks."""
+              logger.info("Handling scheduled event for daily non-compliance check.")
+              rotation_threshold_date = datetime.now(timezone.utc) - relativedelta(months=ROTATION_THRESHOLD_MONTHS)
+              logger.info(f"Rotation threshold date is set to: {rotation_threshold_date}.")
+              non_compliant_findings = get_non_compliant_findings(rotation_threshold_date, account_id, region, product_arn)
+              send_findings_to_security_hub(non_compliant_findings)
+              logger.info("Daily non-compliance check completed.")
+          
+          # ---------- Lambda Handler ----------
+          
+          def lambda_handler(event, context):
+              """Main Lambda handler for scheduled checks and access key deletion events."""
+              logger.info("Starting IAM access key compliance check.")
+              logger.info(f"Received event: {event}")  # Log the event for testing purposes
+              account_id, region = get_account_id_and_region(context)
+              product_arn = f"arn:aws:securityhub:{region}:{account_id}:product/{account_id}/default"
+          
+              try:
+                  # Determine event type and handle accordingly
+                  if 'detail-type' in event and event['detail-type'] == 'AWS API Call via CloudTrail':
+                      event_name = event['detail']['eventName']
+                      if event_name == 'DeleteAccessKey':
+                          logger.info("Detected DeleteAccessKey event.")
+                          handle_delete_access_key_event(event, account_id, region, product_arn)
+                          return {'statusCode': 200, 'message': 'Access key deletion event handled successfully.'}
+                      else:
+                          logger.info(f"Received unsupported event: {event_name}. Ignoring.")
+                          return {'statusCode': 200, 'message': 'Unsupported event type.'}
+                  else:
+                      logger.info("Scheduled trigger detected. Initiating daily compliance check.")
+                      handle_scheduled_event(account_id, region, product_arn)
+                      return {'statusCode': 200, 'message': 'Daily compliance check completed.'}
+          
+              except Exception as e:
+                  logger.error(f"An unexpected error occurred: {e}")
+                  return {'statusCode': 500, 'message': 'An unexpected error occurred while processing the request.'}
+
+  # EventBridge Scheduled Rule for daily invocation
+  IAMAccessKeyComplianceScheduledRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: IAMAccessKeyComplianceDailyRule
+      ScheduleExpression: 'rate(1 day)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt IAMAccessKeyComplianceLambda.Arn
+          Id: IAMAccessKeyComplianceLambdaTarget
+      # Grant permission for EventBridge to invoke the Lambda function
+      DependsOn: IAMAccessKeyComplianceLambdaPermission
+
+  # EventBridge Rule for IAM access key deletion events
+  IAMAccessKeyDeletionRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: IAMAccessKeyDeletionRule
+      EventPattern:
+        source:
+          - aws.iam
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - iam.amazonaws.com
+          eventName:
+            - DeleteAccessKey
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt IAMAccessKeyComplianceLambda.Arn
+          Id: IAMAccessKeyComplianceLambdaTargetDelete
+      DependsOn: IAMAccessKeyComplianceLambdaPermissionDelete
+
+  # Permissions for EventBridge to invoke the Lambda function (Scheduled Rule)
+  IAMAccessKeyComplianceLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref IAMAccessKeyComplianceLambda
+      Action: 'lambda:InvokeFunction'
+      Principal: 'events.amazonaws.com'
+      SourceArn: !GetAtt IAMAccessKeyComplianceScheduledRule.Arn
+
+  # Permissions for EventBridge to invoke the Lambda function (Deletion Event Rule)
+  IAMAccessKeyComplianceLambdaPermissionDelete:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref IAMAccessKeyComplianceLambda
+      Action: 'lambda:InvokeFunction'
+      Principal: 'events.amazonaws.com'
+      SourceArn: !GetAtt IAMAccessKeyDeletionRule.Arn
+
+Outputs:
+  LambdaFunctionName:
+    Description: Name of the IAM Access Key Compliance Lambda Function
+    Value: !Ref IAMAccessKeyComplianceLambda
+  ScheduledRuleName:
+    Description: Name of the EventBridge Scheduled Rule
+    Value: !Ref IAMAccessKeyComplianceScheduledRule
+  DeletionRuleName:
+    Description: Name of the EventBridge Rule for Access Key Deletion Events
+    Value: !Ref IAMAccessKeyDeletionRule
+Explanation of the Template:
+Parameters:
+
+RotationThresholdMonths: Allows you to configure the number of months after which an access key is considered non-compliant.
+SeverityThreshold: Allows you to set the severity level for findings (e.g., LOW, MEDIUM, HIGH, CRITICAL).
+IAM Role (IAMAccessKeyComplianceLambdaRole):
+
+AssumeRolePolicyDocument: Grants Lambda service permission to assume the role.
+ManagedPolicyArns: Includes the AWSLambdaBasicExecutionRole for basic Lambda permissions (e.g., logging).
+Policies: Custom inline policy granting the minimal permissions required:
+IAM Permissions: iam:ListUsers, iam:ListAccessKeys on all resources (*).
+Security Hub Permissions: securityhub:BatchImportFindings, securityhub:BatchUpdateFindings, securityhub:GetFindings on all resources (*).
+Lambda Function (IAMAccessKeyComplianceLambda):
+
+FunctionName: A descriptive name for the Lambda function.
+Handler: Specifies the entry point in the code (index.lambda_handler).
+Runtime: Python 3.9.
+Role: The ARN of the IAM role defined earlier.
+Timeout and MemorySize: Configured to handle the expected workload.
+Environment Variables: Passes the rotation threshold and severity threshold to the Lambda function.
+Code: The provided code is included inline using the ZipFile property.
+EventBridge Scheduled Rule (IAMAccessKeyComplianceScheduledRule):
+
+Triggers the Lambda function once every day (rate(1 day)).
+The DependsOn property ensures the Lambda permission is created before the rule.
+EventBridge Rule for Access Key Deletion (IAMAccessKeyDeletionRule):
+
+Monitors IAM events for the DeleteAccessKey API call.
+Triggers the Lambda function when such events occur.
+The event pattern is defined to capture the specific event.
+Lambda Permissions:
+
+IAMAccessKeyComplianceLambdaPermission and IAMAccessKeyComplianceLambdaPermissionDelete grant EventBridge permission to invoke the Lambda function for the scheduled rule and deletion event rule, respectively.
+Outputs:
+
+Provides the names of the Lambda function and EventBridge rules after the stack is created.
+Best Practices Followed:
+Least Privilege Principle: The IAM role grants only the necessary permissions required for the Lambda function to perform its tasks.
+Parameterized Configuration: Allows easy adjustment of the rotation threshold and severity level without modifying the code.
+Descriptive Resource Names: Resources are named clearly for easier identification and management.
+Dependencies Defined: Ensures resources are created in the correct order using the DependsOn property.
+Environment Variables: Used to pass configuration to the Lambda function, keeping the code flexible and maintainable.
+Logging: The Lambda code includes detailed logging for monitoring and debugging.
+Deployment Instructions:
+Save the Template: Copy the template into a file named iam-access-key-compliance.yaml.
+Deploy the Stack:
+Using AWS CLI:
+bash
+Copy code
+aws cloudformation create-stack --stack-name IAMAccessKeyComplianceStack --template-body file://iam-access-key-compliance.yaml --capabilities CAPABILITY_NAMED_IAM
+Using AWS Management Console:
+Navigate to CloudFormation.
+Click Create Stack and select With new resources (standard).
+Upload the iam-access-key-compliance.yaml file.
+Follow the prompts to create the stack.
+Monitor the Stack Creation: Wait for the stack creation to complete successfully.
+Verify Resources:
+Check that the Lambda function is created and has the correct environment variables.
+Ensure the IAM role has the appropriate permissions.
+Verify that the EventBridge rules are set up correctly.
+Notes:
+Adjust Schedule as Needed: The ScheduleExpression for the scheduled rule is set to run once a day. You can modify this to suit your requirements (e.g., rate(12 hours)).
+Security Hub: Ensure that AWS Security Hub is enabled in your AWS account and region where this stack is deployed.
+Testing: After deployment, you can test the Lambda function manually by invoking it and checking the logs in CloudWatch.
+Permissions Boundary: If your organization uses permissions boundaries or service control policies (SCPs), ensure that the IAM role's permissions are allowed.
