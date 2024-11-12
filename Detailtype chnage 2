@@ -1,0 +1,228 @@
+I apologize for any confusion earlier. It seems that removing the 'detail' key from the event access is causing a problem because the eventType is not defined at the top level of the event object. In AWS Lambda, when events are triggered by services like CloudTrail via EventBridge (formerly CloudWatch Events), the event data is nested under the 'detail' key.
+
+Here’s why you’re seeing the error “event type is not defined”:
+	•	Event Structure: In AWS, events typically have a structure where the important details are nested under the 'detail' key. So, fields like eventType, eventName, userIdentity, and requestParameters are accessed as event['detail']['eventType'], event['detail']['eventName'], etc.
+	•	Removing 'detail' Key: By removing the .get('detail', {}) and trying to access these fields directly from event, the code cannot find them because they are not at the top level of the event object.
+
+Solution:
+
+To fix the error and ensure your code works correctly, we need to access the event fields using the 'detail' key. If you prefer to avoid using .get('detail', {}), you can assign event['detail'] to a variable and then access the fields from there.
+
+Here’s the corrected code with explanations:
+
+def lambda_handler(event, context):
+    """Main Lambda handler for scheduled checks and access key deletion events."""
+    logger.info("Starting IAM access key compliance check.")
+    logger.info(f"Received event: {event}")  # Log the event for testing purposes
+    account_id, region = get_account_id_and_region(context)
+    product_arn = f"arn:aws:securityhub:{region}:{account_id}:product/{account_id}/default"
+
+    try:
+        # Extract the 'detail' part of the event
+        event_detail = event.get('detail', {})
+        
+        # Determine event type and handle accordingly
+        if event_detail.get('eventType') == 'AwsApiCall':
+            event_name = event_detail['eventName']
+            if event_name == 'DeleteAccessKey':
+                logger.info("Detected DeleteAccessKey event.")
+                handle_delete_access_key_event(event, account_id, region, product_arn)
+                return {'statusCode': 200, 'message': 'Access key deletion event handled successfully.'}
+            else:
+                logger.info(f"Received unsupported event: {event_name}. Ignoring.")
+                return {'statusCode': 200, 'message': 'Unsupported event type.'}
+        else:
+            logger.info("Scheduled trigger detected. Initiating daily compliance check.")
+            handle_scheduled_event(account_id, region, product_arn)
+            return {'statusCode': 200, 'message': 'Daily compliance check completed.'}
+
+    except Exception as e:
+        logger.error(f"An unexpected error occurred: {e}")
+        return {'statusCode': 500, 'message': 'An unexpected error occurred while processing the request.'}
+
+Explanation of Changes:
+	•	Using event['detail']: We assign event['detail'] to event_detail to simplify accessing nested fields.
+
+event_detail = event.get('detail', {})
+
+
+	•	Accessing Event Fields: Now, we can access eventType, eventName, and other fields using event_detail:
+
+if event_detail.get('eventType') == 'AwsApiCall':
+    event_name = event_detail['eventName']
+    # ...
+
+
+	•	Adjusting handle_delete_access_key_event Function: In the handle_delete_access_key_event function, we also need to access the nested fields correctly:
+
+def handle_delete_access_key_event(event, account_id, region, product_arn):
+    """Handle IAM access key deletion events."""
+    logger.info("Handling DeleteAccessKey event.")
+    try:
+        event_detail = event.get('detail', {})
+        user_name = event_detail['requestParameters'].get('userName') or event_detail['userIdentity']['userName']
+        access_key_id = event_detail['requestParameters']['accessKeyId']
+        finding_id = f"{user_name}/{access_key_id}"
+        logger.info(f"Access key {access_key_id} for user {user_name} was deleted.")
+
+        # Update existing finding to NEW and ARCHIVED
+        update_finding_to_new_and_archived(finding_id, product_arn)
+
+        # Create deletion finding
+        create_access_key_deletion_finding(user_name, access_key_id, account_id, region, product_arn)
+
+    except Exception as e:
+        logger.error(f"Error handling DeleteAccessKey event: {e}")
+
+
+
+Why We Need 'detail':
+	•	Standard AWS Event Structure: AWS events sent to Lambda functions via EventBridge have a specific structure. The main data is under the 'detail' key.
+Sample event structure:
+
+{
+    "version": "0",
+    "id": "event-id",
+    "detail-type": "AWS API Call via CloudTrail",
+    "source": "aws.iam",
+    "account": "123456789012",
+    "time": "2021-04-12T00:00:00Z",
+    "region": "us-east-1",
+    "resources": [],
+    "detail": {
+        "eventVersion": "1.08",
+        "userIdentity": { ... },
+        "eventTime": "2021-04-12T00:00:00Z",
+        "eventSource": "iam.amazonaws.com",
+        "eventName": "DeleteAccessKey",
+        "awsRegion": "us-east-1",
+        "sourceIPAddress": "x.x.x.x",
+        "userAgent": "AWS Internal",
+        "requestParameters": { ... },
+        "responseElements": null,
+        "eventID": "event-id",
+        "eventType": "AwsApiCall"
+    }
+}
+
+
+	•	Fields Under 'detail': As you can see, eventName, eventType, requestParameters, and userIdentity are all under the 'detail' key.
+	•	Avoiding Key Errors: Accessing these fields without the 'detail' key results in a KeyError because they don’t exist at the top level of the event.
+
+Alternative Approach:
+
+If you want to simplify the code and avoid using .get('detail', {}), you can directly assign event_detail = event['detail'] and let the function fail if 'detail' is not present. This way, you can catch any issues early.
+
+def lambda_handler(event, context):
+    # ...
+    try:
+        event_detail = event['detail']  # This will raise KeyError if 'detail' is missing
+
+        # Proceed with event handling
+        if event_detail.get('eventType') == 'AwsApiCall':
+            # ...
+    except KeyError as e:
+        logger.error(f"Missing expected key in event: {e}")
+        # Handle the error or re-raise
+
+Recommendation:
+	•	Verify Event Structure: Ensure that the events triggering your Lambda function have the expected structure. If you’re using EventBridge with CloudTrail events, the structure will include the 'detail' key.
+	•	Test with Sample Events: Use sample events to test your function. You can retrieve sample events from the AWS console or documentation.
+Example test event for DeleteAccessKey:
+
+{
+    "version": "0",
+    "id": "event-id",
+    "detail-type": "AWS API Call via CloudTrail",
+    "source": "aws.iam",
+    "account": "123456789012",
+    "time": "2021-04-12T00:00:00Z",
+    "region": "us-east-1",
+    "resources": [],
+    "detail": {
+        "eventVersion": "1.08",
+        "userIdentity": {
+            "userName": "test-user",
+            ...
+        },
+        "eventTime": "2021-04-12T00:00:00Z",
+        "eventSource": "iam.amazonaws.com",
+        "eventName": "DeleteAccessKey",
+        "awsRegion": "us-east-1",
+        "sourceIPAddress": "x.x.x.x",
+        "userAgent": "AWS Internal",
+        "requestParameters": {
+            "accessKeyId": "AKIAEXAMPLE",
+            "userName": "test-user"
+        },
+        "responseElements": null,
+        "eventID": "event-id",
+        "eventType": "AwsApiCall"
+    }
+}
+
+
+	•	Adjust Based on Event Source: If your events come from a different source or have a different structure, adjust the code accordingly. For instance, if you’re manually invoking the Lambda function or using a custom event source that doesn’t include 'detail', you need to match your code to the event’s structure.
+
+Final Code Snippet with Explanations:
+
+def lambda_handler(event, context):
+    """Main Lambda handler for scheduled checks and access key deletion events."""
+    logger.info("Starting IAM access key compliance check.")
+    logger.info(f"Received event: {event}")
+    account_id, region = get_account_id_and_region(context)
+    product_arn = f"arn:aws:securityhub:{region}:{account_id}:product/{account_id}/default"
+
+    try:
+        # Extract event details
+        event_detail = event.get('detail')
+        if event_detail:
+            # Handle AWS API Call events
+            if event_detail.get('eventType') == 'AwsApiCall':
+                event_name = event_detail.get('eventName')
+                if event_name == 'DeleteAccessKey':
+                    logger.info("Detected DeleteAccessKey event.")
+                    handle_delete_access_key_event(event, account_id, region, product_arn)
+                    return {'statusCode': 200, 'message': 'Access key deletion event handled successfully.'}
+                else:
+                    logger.info(f"Received unsupported event: {event_name}. Ignoring.")
+                    return {'statusCode': 200, 'message': 'Unsupported event type.'}
+            else:
+                logger.info("Event is not an AWS API Call. Proceeding to scheduled event handling.")
+                handle_scheduled_event(account_id, region, product_arn)
+                return {'statusCode': 200, 'message': 'Event handled as scheduled event.'}
+        else:
+            # No 'detail' key indicates a scheduled event
+            logger.info("No 'detail' key in event. Assuming scheduled trigger.")
+            handle_scheduled_event(account_id, region, product_arn)
+            return {'statusCode': 200, 'message': 'Daily compliance check completed.'}
+
+    except Exception as e:
+        logger.error(f"An unexpected error occurred: {e}")
+        return {'statusCode': 500, 'message': 'An unexpected error occurred while processing the request.'}
+
+Key Points:
+	•	Use event['detail']: Access event details using event['detail'] to ensure you’re referencing the correct part of the event.
+	•	Check for 'detail' Key: Use event.get('detail') to safely check if the key exists before accessing it.
+	•	Adjust handle_delete_access_key_event: Update this function to access fields from event['detail']:
+
+def handle_delete_access_key_event(event, account_id, region, product_arn):
+    logger.info("Handling DeleteAccessKey event.")
+    try:
+        event_detail = event['detail']
+        user_name = event_detail['requestParameters'].get('userName') or event_detail['userIdentity']['userName']
+        access_key_id = event_detail['requestParameters']['accessKeyId']
+        # Rest of the code...
+
+
+
+Conclusion:
+
+The error you’re experiencing is due to attempting to access eventType directly from the event object, whereas it resides under the 'detail' key in the event structure provided by AWS services like CloudTrail via EventBridge.
+
+To resolve this issue:
+	•	Use event['detail'] to access nested event data.
+	•	Ensure that your code aligns with the actual structure of the events your Lambda function receives.
+	•	Test your Lambda function with sample events to validate its behavior.
+
+If you have further questions or need additional assistance, please let me know!
