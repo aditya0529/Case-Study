@@ -58,7 +58,7 @@ def is_key_non_compliant(key, rotation_threshold_date):
         logger.debug(f"Access key {key_id} is compliant.")
     return non_compliant
 
-def construct_finding(user_name, key, key_age_days, account_id, region, product_arn, record_state='ACTIVE', workflow_status='NEW', compliance_status='FAILED', severity_label=SEVERITY_THRESHOLD):
+def construct_finding(user_name, key, key_age_days, account_id, region, product_arn):
     """Construct a Security Hub finding for a non-compliant access key."""
     logger.info(f"Constructing finding for user: {user_name}, key ID: {key['AccessKeyId']}.")
     key_id = key['AccessKeyId']
@@ -69,9 +69,9 @@ def construct_finding(user_name, key, key_age_days, account_id, region, product_
         "GeneratorId": "iam-access-key-rotation-check",
         "AwsAccountId": account_id,
         "Types": ["Software and Configuration Checks/AWS Security Best Practices"],
-        "CreatedAt": datetime.now(timezone.utc).isoformat(),
+        "CreatedAt": key['CreateDate'].replace(tzinfo=timezone.utc).isoformat(),
         "UpdatedAt": datetime.now(timezone.utc).isoformat(),
-        "Severity": {"Label": severity_label},
+        "Severity": {"Label": SEVERITY_THRESHOLD},
         "Title": "IAM Access Key Rotation Best Practice Violation",
         "Description": (
             f"Active IAM access key {key_id} for user {user_name} is older than "
@@ -93,16 +93,16 @@ def construct_finding(user_name, key, key_age_days, account_id, region, product_
                 }
             }
         ],
-        "Compliance": {"Status": compliance_status},
-        "Workflow": {"Status": workflow_status},
-        "RecordState": record_state
+        "Compliance": {"Status": "FAILED"},
+        "Workflow": {"Status": "NEW"},
+        "RecordState": "ACTIVE"
     }
     logger.debug(f"Constructed finding: {finding}.")
     return finding
 
 def finding_exists(finding_id, product_arn):
     """Check if a matching finding already exists in Security Hub."""
-    logger.info(f"Checking if finding {finding_id} exists in Security Hub with matching severity and compliance status.")
+    logger.info(f"Checking if finding {finding_id} exists in Security Hub.")
     try:
         response = securityhub_client.get_findings(
             Filters={
@@ -113,9 +113,9 @@ def finding_exists(finding_id, product_arn):
         )
         exists = len(response['Findings']) > 0
         if exists:
-            logger.info(f"Matching finding {finding_id} already exists in Security Hub.")
+            logger.info(f"Finding {finding_id} exists in Security Hub.")
         else:
-            logger.info(f"No matching finding {finding_id} found in Security Hub.")
+            logger.info(f"Finding {finding_id} does not exist in Security Hub.")
         return exists
     except ClientError as e:
         logger.error(f"Error checking existence of finding {finding_id}: {e}")
@@ -142,7 +142,7 @@ def get_non_compliant_findings(rotation_threshold_date, account_id, region, prod
                         non_compliant_findings.append(finding)
                         logger.info(f"Added finding for user {user_name}, key {key_id}.")
                     else:
-                        logger.info(f"Finding {finding_id} already exists with matching attributes. Skipping.")
+                        logger.info(f"Finding {finding_id} already exists. Skipping.")
         except ClientError as e:
             logger.error(f"Error retrieving access keys for user {user_name}: {e}")
             continue
@@ -150,7 +150,7 @@ def get_non_compliant_findings(rotation_threshold_date, account_id, region, prod
     return non_compliant_findings
 
 def send_findings_to_security_hub(findings):
-    """Send the non-compliant findings to AWS Security Hub."""
+    """Send findings to AWS Security Hub."""
     if not findings:
         logger.info("No new findings to send to Security Hub.")
         return
@@ -165,34 +165,27 @@ def send_findings_to_security_hub(findings):
         except ClientError as e:
             logger.error(f"Error sending findings to Security Hub: {e}")
 
-def update_finding_to_new_and_archived(finding_id, user_name, access_key_id, account_id, region, product_arn):
-    """Update the Security Hub finding to NEW and ARCHIVED using batch_import_findings."""
-    logger.info(f"Updating finding {finding_id} to NEW and ARCHIVED using batch_import_findings.")
-
-    # Construct a dummy key object to pass to construct_finding
-    key = {
-        'AccessKeyId': access_key_id,
-        'Status': 'Inactive',  # Assuming the key is no longer active
-        'CreateDate': datetime.now(timezone.utc)  # Use current time or retrieve from previous finding if possible
-    }
-
-    # Re-import the finding with updated status
-    finding = construct_finding(
-        user_name,
-        key,
-        key_age_days=0,
-        account_id=account_id,
-        region=region,
-        product_arn=product_arn,
-        record_state='ARCHIVED',
-        workflow_status='RESOLVED',
-        compliance_status='PASSED',
-        severity_label='INFORMATIONAL'
-    )
-
+def update_finding_to_new_and_archived(finding_id, product_arn):
+    """Update the Security Hub finding to set RecordState to ARCHIVED."""
+    logger.info(f"Updating finding {finding_id} to set RecordState to ARCHIVED using batch_import_findings.")
     try:
-        securityhub_client.batch_import_findings(Findings=[finding])
-        logger.info(f"Finding {finding_id} updated and archived in Security Hub.")
+        # Retrieve the existing finding
+        response = securityhub_client.get_findings(
+            Filters={
+                'Id': [{'Value': finding_id, 'Comparison': 'EQUALS'}],
+                'ProductArn': [{'Value': product_arn, 'Comparison': 'EQUALS'}]
+            }
+        )
+        if response['Findings']:
+            finding = response['Findings'][0]
+            # Update RecordState to ARCHIVED
+            finding['RecordState'] = 'ARCHIVED'
+            finding['UpdatedAt'] = datetime.now(timezone.utc).isoformat()
+            # Re-import the finding
+            securityhub_client.batch_import_findings(Findings=[finding])
+            logger.info(f"Finding {finding_id} updated to RecordState ARCHIVED.")
+        else:
+            logger.info(f"Finding {finding_id} does not exist or is already archived.")
     except ClientError as e:
         logger.error(f"Error updating finding {finding_id}: {e}")
 
@@ -246,8 +239,8 @@ def handle_delete_access_key_event(event, account_id, region, product_arn):
         finding_id = f"{user_name}/{access_key_id}"
         logger.info(f"Access key {access_key_id} for user {user_name} was deleted.")
 
-        # Update existing finding using batch_import_findings
-        update_finding_to_new_and_archived(finding_id, user_name, access_key_id, account_id, region, product_arn)
+        # Update existing finding to set RecordState to ARCHIVED
+        update_finding_to_new_and_archived(finding_id, product_arn)
 
         # Create deletion finding
         create_access_key_deletion_finding(user_name, access_key_id, account_id, region, product_arn)
@@ -269,7 +262,7 @@ def handle_scheduled_event(account_id, region, product_arn):
 def lambda_handler(event, context):
     """Main Lambda handler for scheduled checks and access key deletion events."""
     logger.info("Starting IAM access key compliance check.")
-    logger.info(f"Received event: {event}")  # Log the event for testing purposes
+    logger.info(f"Received event: {event}")
     account_id, region = get_account_id_and_region(context)
     product_arn = f"arn:aws:securityhub:{region}:{account_id}:product/{account_id}/default"
 
