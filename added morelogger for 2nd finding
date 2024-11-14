@@ -1,0 +1,46 @@
+def create_access_key_deletion_finding(user_name, access_key_id, account_id, region, product_arn):
+    """Create a finding to document that an access key was deleted."""
+    logger.info(f"Creating deletion finding for access key {access_key_id} of user {user_name}.")
+    # Use the same Type and Title as the original finding
+    finding_id = f"{user_name}/{access_key_id}-deletion"
+    finding = {
+        "SchemaVersion": "2018-10-08",
+        "Id": finding_id,
+        "ProductArn": product_arn,
+        "GeneratorId": "iam-access-key-rotation-check",
+        "AwsAccountId": account_id,
+        "Types": ["Software and Configuration Checks/AWS Security Best Practices"],
+        "CreatedAt": datetime.now(timezone.utc).isoformat(),
+        "UpdatedAt": datetime.now(timezone.utc).isoformat(),
+        "Severity": {"Label": "INFORMATIONAL"},
+        "Title": "IAM Access Key Rotation Best Practice Violation",
+        "Description": f"IAM access key {access_key_id} for user {user_name} has been deleted.",
+        "Resources": [
+            {
+                "Type": "AwsIamAccessKey",
+                "Id": f"arn:aws:iam::{account_id}:user/{user_name}",
+                "Partition": "aws",
+                "Region": region,
+                "Details": {
+                    "AwsIamAccessKey": {
+                        "UserName": user_name,
+                        "Status": "Deleted",
+                        "AccessKeyId": access_key_id
+                    }
+                }
+            }
+        ],
+        "Compliance": {"Status": "NOT_AVAILABLE"},
+        "Workflow": {"Status": "NEW"},
+        "RecordState": "ARCHIVED"
+    }
+    logger.debug(f"Constructed deletion finding: {finding}.")
+    try:
+        response = securityhub_client.batch_import_findings(Findings=[finding])
+        logger.info(f"Deletion finding {finding_id} created in Security Hub.")
+        logger.debug(f"batch_import_findings response: {response}")
+        # Check for any failed findings
+        if response.get('FailedFindings'):
+            logger.error(f"Failed to import deletion finding {finding_id}: {response['FailedFindings']}")
+    except ClientError as e:
+        logger.error(f"Error creating deletion finding {finding_id}: {e}")
