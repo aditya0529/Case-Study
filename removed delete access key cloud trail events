@@ -1,0 +1,127 @@
+import boto3
+import logging
+import os
+from datetime import datetime, timezone
+from dateutil.relativedelta import relativedelta
+from botocore.exceptions import ClientError
+
+# Initialize AWS clients
+iam_client = boto3.client('iam')
+config_client = boto3.client('config')
+
+# Configure logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# Read configuration from environment variables
+ROTATION_THRESHOLD_MONTHS = int(os.environ.get('ROTATION_THRESHOLD_MONTHS', '23'))
+
+# ---------- Helper Functions ----------
+
+def get_account_id_and_region(context):
+    """Extract AWS account ID and region from the Lambda context."""
+    logger.info("Extracting AWS account ID and region from the context.")
+    arn_parts = context.invoked_function_arn.split(":")
+    region = arn_parts[3]
+    account_id = arn_parts[4]
+    logger.info(f"Extracted account ID: {account_id} and region: {region}.")
+    return account_id, region
+
+def list_all_users():
+    """List all IAM users."""
+    logger.info("Listing all IAM users.")
+    users = []
+    paginator = iam_client.get_paginator('list_users')
+    for page in paginator.paginate():
+        users.extend(page['Users'])
+    logger.info(f"Total IAM users retrieved: {len(users)}.")
+    return users
+
+def list_access_keys_for_user(user_name):
+    """List all access keys for a given IAM user."""
+    logger.info(f"Listing access keys for user: {user_name}.")
+    access_keys = []
+    key_paginator = iam_client.get_paginator('list_access_keys')
+    for key_page in key_paginator.paginate(UserName=user_name):
+        access_keys.extend(key_page['AccessKeyMetadata'])
+    logger.info(f"User {user_name} has {len(access_keys)} access keys.")
+    return access_keys
+
+def is_key_non_compliant(key, rotation_threshold_date):
+    """Check if an access key is non-compliant."""
+    non_compliant = key['Status'] == 'Active' and key['CreateDate'] < rotation_threshold_date
+    key_id = key['AccessKeyId']
+    if non_compliant:
+        logger.debug(f"Access key {key_id} is non-compliant.")
+    else:
+        logger.debug(f"Access key {key_id} is compliant.")
+    return non_compliant
+
+def check_and_update_config_compliance(user_name, compliance_type):
+    """Update the IAM user's compliance status in AWS Config."""
+    logger.info(f"Updating AWS Config compliance for user {user_name} to {compliance_type}.")
+    try:
+        config_client.put_evaluations(
+            Evaluations=[
+                {
+                    'ComplianceResourceType': 'AWS::IAM::User',
+                    'ComplianceResourceId': user_name,
+                    'ComplianceType': compliance_type,
+                    'OrderingTimestamp': datetime.now(timezone.utc)
+                }
+            ],
+            ResultToken='string'  # Replace 'string' with a valid ResultToken if required
+        )
+        logger.info(f"Set compliance status of user {user_name} to {compliance_type}.")
+    except ClientError as e:
+        logger.error(f"Error updating AWS Config compliance for user {user_name}: {e}")
+
+def get_non_compliant_findings(rotation_threshold_date, account_id, region):
+    """Retrieve non-compliant IAM access keys."""
+    logger.info("Retrieving non-compliant IAM access keys.")
+    users = list_all_users()
+    for user in users:
+        user_name = user['UserName']
+        logger.info(f"Processing user: {user_name}.")
+        try:
+            access_keys = list_access_keys_for_user(user_name)
+            is_user_compliant = True  # Assume user is compliant until a non-compliant key is found
+            for key in access_keys:
+                if is_key_non_compliant(key, rotation_threshold_date):
+                    is_user_compliant = False
+                    # Update compliance to NON_COMPLIANT
+                    check_and_update_config_compliance(user_name, 'NON_COMPLIANT')
+                    break  # No need to check further keys, user is non-compliant
+            if is_user_compliant:
+                # Update compliance to COMPLIANT
+                check_and_update_config_compliance(user_name, 'COMPLIANT')
+        except ClientError as e:
+            logger.error(f"Error retrieving access keys for user {user_name}: {e}")
+            continue
+    logger.info("Completed processing all users.")
+
+def handle_scheduled_event(account_id, region):
+    """Handle scheduled events for daily non-compliance checks."""
+    logger.info("Handling scheduled event for daily non-compliance check.")
+    rotation_threshold_date = datetime.now(timezone.utc) - relativedelta(months=ROTATION_THRESHOLD_MONTHS)
+    logger.info(f"Rotation threshold date is set to: {rotation_threshold_date}.")
+    get_non_compliant_findings(rotation_threshold_date, account_id, region)
+    logger.info("Daily non-compliance check completed.")
+
+# ---------- Lambda Handler ----------
+
+def lambda_handler(event, context):
+    """Main Lambda handler for scheduled compliance checks."""
+    logger.info("Starting IAM access key compliance check.")
+    logger.info(f"Received event: {event}")
+    account_id, region = get_account_id_and_region(context)
+
+    try:
+        # Only handle scheduled events
+        logger.info("Scheduled trigger detected. Initiating daily compliance check.")
+        handle_scheduled_event(account_id, region)
+        return {'statusCode': 200, 'message': 'Daily compliance check completed.'}
+
+    except Exception as e:
+        logger.error(f"An unexpected error occurred: {e}")
+        return {'statusCode': 500, 'message': 'An unexpected error occurred while processing the request.'}
