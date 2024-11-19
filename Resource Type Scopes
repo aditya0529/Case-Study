@@ -20,3 +20,10 @@ IAMAccessKeyComplianceRule:
           MaximumExecutionFrequency: TwentyFour_Hours
     InputParameters:
       RotationThresholdMonths: !Ref RotationThresholdMonths
+IAMAccessKeyCompliancePermission:
+  Type: AWS::Lambda::Permission
+  Properties:
+    FunctionName: !Ref IAMAccessKeyComplianceFunction
+    Action: lambda:InvokeFunction
+    Principal: config.amazonaws.com
+    SourceArn: !Sub 'arn:${AWS::Partition}:config:${AWS::Region}:${AWS::AccountId}:config-rule/${IAMAccessKeyComplianceRule}'
