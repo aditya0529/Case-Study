@@ -1,0 +1,22 @@
+# AWS Config Custom Rule
+IAMAccessKeyComplianceRule:
+  Type: AWS::Config::ConfigRule
+  Properties:
+    ConfigRuleName: iam-access-key-rotation-compliance
+    Description: Checks whether IAM users' access keys are rotated within the specified number of months.
+    Scope:
+      ComplianceResourceTypes:
+        - AWS::IAM::User
+    Source:
+      Owner: CUSTOM_LAMBDA
+      SourceIdentifier: !GetAtt IAMAccessKeyComplianceFunction.Arn
+      SourceDetails:
+        - EventSource: aws.config
+          MessageType: ConfigurationItemChangeNotification
+          ResourceTypesScope:
+            - AWS::IAM::User
+        - EventSource: aws.config
+          MessageType: ScheduledNotification
+          MaximumExecutionFrequency: TwentyFour_Hours
+    InputParameters:
+      RotationThresholdMonths: !Ref RotationThresholdMonths
